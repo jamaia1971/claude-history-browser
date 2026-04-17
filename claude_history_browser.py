@@ -20,6 +20,14 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 
+# ── App metadata (shown in the About dialog and MD export headers) ───────────
+APP_NAME = "Claude History Browser"
+APP_VERSION = "1.1.0"
+APP_AUTHOR = "Joao (@jamaia1971)"
+APP_LICENSE = "MIT"
+APP_REPO = "https://github.com/jamaia1971/claude-history-browser"
+APP_COPYRIGHT = "Claude © Anthropic, PBC. This tool is an independent project and is not affiliated with Anthropic."
+
 # ── Try to import Flask, install if missing ─────────────────────────────────
 try:
     from flask import Flask, jsonify, request, render_template_string, Response
@@ -350,6 +358,15 @@ def project_key(filepath: Path) -> str:
     return project_display_name(filepath)
 
 
+def _first_nonempty(messages, key):
+    """Return the first non-empty value of `key` across the records."""
+    for m in messages:
+        v = m.get(key)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    return None
+
+
 def conversation_summary(filepath: Path) -> dict | None:
     messages = parse_jsonl(filepath)
     if not messages:
@@ -380,6 +397,14 @@ def conversation_summary(filepath: Path) -> dict | None:
             if model:
                 break
 
+    # Extra metadata pulled from the JSONL records themselves.
+    # Claude Code / Cowork transcripts commonly carry these fields.
+    session_id = _first_nonempty(messages, "sessionId")
+    cwd = _first_nonempty(messages, "cwd")
+    git_branch = _first_nonempty(messages, "gitBranch")
+    cc_version = _first_nonempty(messages, "version")
+    user_type = _first_nonempty(messages, "userType")
+
     return {
         "id": filepath.stem,
         "file": str(filepath),
@@ -392,6 +417,11 @@ def conversation_summary(filepath: Path) -> dict | None:
         "first_ts": first_ts.isoformat() if first_ts else None,
         "last_ts": last_ts.isoformat() if last_ts else None,
         "size_kb": round(filepath.stat().st_size / 1024, 1),
+        "session_id": session_id,
+        "cwd": cwd,
+        "git_branch": git_branch,
+        "cc_version": cc_version,
+        "user_type": user_type,
     }
 
 
@@ -585,14 +615,30 @@ def conversation_to_markdown(filepath: Path) -> str:
     lines = []
     lines.append(f"# {summary['title']}")
     lines.append("")
+    lines.append("## Conversation information")
+    lines.append("")
+    lines.append(f"- **Conversation ID:** `{summary['id']}`")
     lines.append(f"- **Project:** `{summary['project']}`")
+    if summary.get("cwd"):
+        lines.append(f"- **Working directory (cwd):** `{summary['cwd']}`")
+    if summary.get("git_branch"):
+        lines.append(f"- **Git branch / commit:** `{summary['git_branch']}`")
+    if summary.get("session_id"):
+        lines.append(f"- **Session ID:** `{summary['session_id']}`")
     if summary.get("first_ts"):
         lines.append(f"- **Started:** {summary['first_ts']}")
     if summary.get("last_ts"):
         lines.append(f"- **Last turn:** {summary['last_ts']}")
     lines.append(f"- **Messages:** {summary['user_count']} user · {summary['turn_count']} total")
     lines.append(f"- **Model:** {summary['model']}")
+    if summary.get("cc_version"):
+        lines.append(f"- **Claude Code version:** {summary['cc_version']}")
+    if summary.get("user_type"):
+        lines.append(f"- **User type:** {summary['user_type']}")
     lines.append(f"- **Source file:** `{summary['file']}`")
+    lines.append(f"- **File size:** {summary['size_kb']} KB")
+    lines.append(f"- **Exported by:** {APP_NAME} v{APP_VERSION}")
+    lines.append(f"- **Exported at:** {datetime.now().isoformat(timespec='seconds')}")
     lines.append("")
     lines.append("---")
     lines.append("")
@@ -646,18 +692,21 @@ def conversation_to_markdown(filepath: Path) -> str:
     return "\n".join(lines)
 
 
-@app.route("/api/download", methods=["POST"])
-def api_download():
-    """Bundle the selected conversations into a single Markdown file.
+@app.route("/api/about")
+def api_about():
+    """App metadata for the About dialog."""
+    return jsonify({
+        "name": APP_NAME,
+        "version": APP_VERSION,
+        "author": APP_AUTHOR,
+        "license": APP_LICENSE,
+        "repo": APP_REPO,
+        "copyright": APP_COPYRIGHT,
+    })
 
-    Request body: {"ids": ["<conv_id>", ...]}
-    """
-    body = request.get_json(silent=True) or {}
-    ids = body.get("ids") or []
-    if not isinstance(ids, list) or not ids:
-        return jsonify({"error": "No conversations selected"}), 400
 
-    # Build a quick lookup of {stem: path} so we don't rglob per-id
+def _build_export_markdown(ids):
+    """Shared builder used by both /api/download and /api/copy."""
     all_files = {f.stem: f for f in HISTORY_PATH.rglob("*.jsonl")}
 
     parts = []
@@ -666,6 +715,9 @@ def api_download():
     parts.append("")
     parts.append(f"- **Exported:** {stamp}")
     parts.append(f"- **Conversations:** {len(ids)}")
+    parts.append(f"- **Generator:** {APP_NAME} v{APP_VERSION} — {APP_REPO}")
+    parts.append(f"- **License:** {APP_LICENSE}")
+    parts.append(f"- **Notice:** {APP_COPYRIGHT}")
     parts.append("")
     parts.append("---")
     parts.append("")
@@ -685,7 +737,33 @@ def api_download():
         parts.append(f"> ⚠️ Could not find: {', '.join(missing)}")
         parts.append("")
 
-    payload = "\n".join(parts)
+    return "\n".join(parts)
+
+
+@app.route("/api/copy", methods=["POST"])
+def api_copy():
+    """Return the selected conversations as a raw Markdown string in JSON —
+    so the browser can drop it on the system clipboard."""
+    body = request.get_json(silent=True) or {}
+    ids = body.get("ids") or []
+    if not isinstance(ids, list) or not ids:
+        return jsonify({"error": "No conversations selected"}), 400
+    payload = _build_export_markdown(ids)
+    return jsonify({"markdown": payload, "length": len(payload)})
+
+
+@app.route("/api/download", methods=["POST"])
+def api_download():
+    """Bundle the selected conversations into a single Markdown file.
+
+    Request body: {"ids": ["<conv_id>", ...]}
+    """
+    body = request.get_json(silent=True) or {}
+    ids = body.get("ids") or []
+    if not isinstance(ids, list) or not ids:
+        return jsonify({"error": "No conversations selected"}), 400
+
+    payload = _build_export_markdown(ids)
     filename = f"claude-history-{datetime.now().strftime('%Y%m%d-%H%M%S')}.md"
     return Response(
         payload,
@@ -702,6 +780,7 @@ HTML_TEMPLATE = r"""
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Claude History Browser</title>
+<meta name="application-name" content="Claude History Browser">
 <style>
   :root {
     --bg: #0f1117;
@@ -729,12 +808,28 @@ HTML_TEMPLATE = r"""
 
   /* ── Header ── */
   header { display: flex; align-items: center; gap: 12px; padding: 10px 16px; background: var(--surface); border-bottom: 1px solid var(--border); flex-shrink: 0; }
-  header h1 { font-size: 16px; font-weight: 600; color: var(--accent); white-space: nowrap; }
+  header h1 { font-size: 16px; font-weight: 600; color: var(--accent); white-space: nowrap; cursor: pointer; user-select: none; padding: 2px 6px; border-radius: 6px; transition: background 0.15s, color 0.15s; }
+  header h1:hover { background: var(--surface2); color: #e0a8ff; }
   header h1 span { color: var(--text2); font-weight: 400; }
   #search-global { flex: 1; background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 6px 12px; color: var(--text); font-size: 13px; outline: none; }
   #search-global:focus { border-color: var(--accent); }
   #path-btn { background: var(--surface2); border: 1px solid var(--border); color: var(--text2); border-radius: 6px; padding: 5px 10px; cursor: pointer; font-size: 12px; white-space: nowrap; }
   #path-btn:hover { color: var(--accent); border-color: var(--accent); }
+
+  /* ── About modal ── */
+  #about-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,0.55); display: none; align-items: center; justify-content: center; z-index: 100; }
+  #about-backdrop.open { display: flex; }
+  #about-modal { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; max-width: 460px; width: calc(100% - 32px); padding: 22px 24px; box-shadow: 0 12px 48px rgba(0,0,0,0.5); color: var(--text); }
+  #about-modal h2 { font-size: 18px; color: var(--accent); margin-bottom: 4px; }
+  #about-modal .about-version { font-size: 12px; color: var(--text3); margin-bottom: 14px; }
+  #about-modal dl { display: grid; grid-template-columns: 110px 1fr; gap: 6px 12px; font-size: 13px; margin-bottom: 14px; }
+  #about-modal dt { color: var(--text3); }
+  #about-modal dd { color: var(--text); word-break: break-word; }
+  #about-modal a { color: var(--accent2); text-decoration: none; }
+  #about-modal a:hover { text-decoration: underline; }
+  #about-modal .about-copyright { font-size: 11px; color: var(--text3); border-top: 1px solid var(--border); padding-top: 10px; line-height: 1.5; }
+  #about-close { margin-top: 14px; background: var(--accent); color: #0f1117; border: 0; border-radius: 6px; padding: 6px 14px; cursor: pointer; font-weight: 600; font-size: 13px; }
+  #about-close:hover { filter: brightness(1.1); }
 
   /* ── Layout ── */
   .body { display: flex; flex: 1; overflow: hidden; }
@@ -744,9 +839,17 @@ HTML_TEMPLATE = r"""
   .sidebar-top { padding: 10px 12px; border-bottom: 1px solid var(--border); flex-shrink: 0; display: flex; flex-direction: column; gap: 8px; }
   .row { display: flex; align-items: center; gap: 8px; }
   #project-select { flex: 1; min-width: 0; background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 5px 8px; color: var(--text); font-size: 13px; cursor: pointer; }
-  #download-btn { display: block; width: 100%; background: var(--accent); color: #0f1117; border: 2px solid var(--accent); border-radius: 6px; padding: 8px 12px; cursor: pointer; font-size: 13px; font-weight: 700; white-space: nowrap; text-align: center; transition: filter 0.15s, background 0.15s, color 0.15s; }
-  #download-btn:disabled { background: transparent; color: var(--accent); cursor: not-allowed; opacity: 0.7; }
+
+  /* ── Action buttons: Download + Copy, side by side ── */
+  .action-row { display: flex; gap: 6px; }
+  .action-btn { flex: 1; min-width: 0; border-radius: 6px; padding: 6px 8px; cursor: pointer; font-size: 12px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; text-align: center; transition: filter 0.15s, background 0.15s, color 0.15s, border-color 0.15s; }
+  #download-btn { background: var(--accent); color: #0f1117; border: 1px solid var(--accent); }
+  #download-btn:disabled { background: transparent; color: var(--accent); cursor: not-allowed; opacity: 0.55; }
   #download-btn:not(:disabled):hover { filter: brightness(1.1); }
+  #copy-btn { background: transparent; color: var(--accent2); border: 1px solid var(--accent2); }
+  #copy-btn:disabled { color: var(--text3); border-color: var(--border); cursor: not-allowed; opacity: 0.55; }
+  #copy-btn:not(:disabled):hover { background: var(--accent2); color: #0f1117; }
+  #copy-btn.copied { background: #2f8a4e; border-color: #2f8a4e; color: #fff; }
 
   /* ── Splitter / resizer between sidebar and main ── */
   .splitter {
@@ -854,10 +957,25 @@ HTML_TEMPLATE = r"""
 <body>
 
 <header>
-  <h1>Claude <span>History</span></h1>
+  <h1 id="app-title" title="About this app">Claude <span>History Browser</span></h1>
   <input id="search-global" type="search" placeholder="Search all conversations... (press Enter)" />
   <button id="path-btn" title="Change history folder">📂 Change folder</button>
 </header>
+
+<!-- About modal -->
+<div id="about-backdrop" role="dialog" aria-modal="true" aria-labelledby="about-title">
+  <div id="about-modal">
+    <h2 id="about-title">Claude History Browser</h2>
+    <div class="about-version" id="about-version">v—</div>
+    <dl>
+      <dt>Author</dt><dd id="about-author">—</dd>
+      <dt>License</dt><dd id="about-license">—</dd>
+      <dt>Repository</dt><dd><a id="about-repo" href="#" target="_blank" rel="noopener noreferrer">—</a></dd>
+    </dl>
+    <div class="about-copyright" id="about-copyright">—</div>
+    <button id="about-close" type="button">Close</button>
+  </div>
+</div>
 
 <div class="body">
   <aside>
@@ -865,7 +983,10 @@ HTML_TEMPLATE = r"""
       <div class="row">
         <select id="project-select"><option value="">All projects</option></select>
       </div>
-      <button id="download-btn" disabled>⬇︎ Download selected as Markdown (0)</button>
+      <div class="action-row">
+        <button id="download-btn" class="action-btn" disabled title="Download the selected conversations as a single .md file">⬇︎ Download (0)</button>
+        <button id="copy-btn" class="action-btn" disabled title="Copy the selected conversations to the clipboard as Markdown">⧉ Copy (0)</button>
+      </div>
       <div id="filter-pills" class="pills"></div>
     </div>
     <div id="conv-count">Loading…</div>
@@ -1131,9 +1252,20 @@ function renderList(convs) {
 }
 
 function updateDownloadBtn() {
-  const btn = document.getElementById('download-btn');
-  btn.textContent = `⬇︎ Download selected as Markdown (${selected.size})`;
-  btn.disabled = selected.size === 0;
+  const dl = document.getElementById('download-btn');
+  const cp = document.getElementById('copy-btn');
+  const n = selected.size;
+  if (dl) {
+    dl.textContent = `⬇︎ Download (${n})`;
+    dl.disabled = n === 0;
+  }
+  if (cp) {
+    // Don't overwrite the transient "Copied!" label while it's showing.
+    if (!cp.classList.contains('copied')) {
+      cp.textContent = `⧉ Copy (${n})`;
+    }
+    cp.disabled = n === 0;
+  }
   syncSelectAllCheckbox();
 }
 
@@ -1239,6 +1371,106 @@ document.getElementById('download-btn').addEventListener('click', async () => {
     btn.textContent = originalText;
     btn.disabled = selected.size === 0;
   }
+});
+
+// ── Copy selected as Markdown (to clipboard) ─────────────────────────────────
+async function copyTextToClipboard(text) {
+  // Preferred: async clipboard API (needs http://localhost which is a secure context).
+  if (navigator.clipboard && window.isSecureContext) {
+    try {
+      await navigator.clipboard.writeText(text);
+      return true;
+    } catch (_) { /* fall through */ }
+  }
+  // Fallback: hidden textarea + execCommand.
+  try {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.position = 'fixed';
+    ta.style.top = '-1000px';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.focus();
+    ta.select();
+    const ok = document.execCommand('copy');
+    ta.remove();
+    return ok;
+  } catch (_) {
+    return false;
+  }
+}
+
+document.getElementById('copy-btn').addEventListener('click', async () => {
+  if (!selected.size) return;
+  const btn = document.getElementById('copy-btn');
+  const n = selected.size;
+  btn.textContent = 'Preparing…';
+  btn.disabled = true;
+
+  try {
+    const res = await fetch('/api/copy', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ids: [...selected]}),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({error: 'Copy failed'}));
+      alert(err.error || 'Copy failed');
+      return;
+    }
+    const data = await res.json();
+    const md = data.markdown || '';
+    const ok = await copyTextToClipboard(md);
+    if (ok) {
+      btn.classList.add('copied');
+      btn.textContent = `✓ Copied ${n}!`;
+      setTimeout(() => {
+        btn.classList.remove('copied');
+        updateDownloadBtn();
+      }, 1600);
+    } else {
+      alert('Could not write to the clipboard. Try using the Download button instead.');
+    }
+  } finally {
+    btn.disabled = selected.size === 0;
+    // Keep transient label if still in "copied" state; otherwise refresh counts.
+    if (!btn.classList.contains('copied')) updateDownloadBtn();
+  }
+});
+
+// ── About dialog ─────────────────────────────────────────────────────────────
+let aboutLoaded = false;
+async function openAbout() {
+  const bd = document.getElementById('about-backdrop');
+  if (!aboutLoaded) {
+    try {
+      const res = await fetch('/api/about');
+      const info = await res.json();
+      document.getElementById('about-title').textContent = info.name || 'Claude History Browser';
+      document.getElementById('about-version').textContent = 'v' + (info.version || '—');
+      document.getElementById('about-author').textContent = info.author || '—';
+      document.getElementById('about-license').textContent = (info.license || '—') + ' License';
+      const repoA = document.getElementById('about-repo');
+      if (info.repo) {
+        repoA.href = info.repo;
+        repoA.textContent = info.repo;
+      }
+      document.getElementById('about-copyright').textContent = info.copyright || '';
+      aboutLoaded = true;
+    } catch (_) { /* show whatever we have */ }
+  }
+  bd.classList.add('open');
+}
+function closeAbout() {
+  document.getElementById('about-backdrop').classList.remove('open');
+}
+document.getElementById('app-title').addEventListener('click', openAbout);
+document.getElementById('about-close').addEventListener('click', closeAbout);
+document.getElementById('about-backdrop').addEventListener('click', (e) => {
+  if (e.target.id === 'about-backdrop') closeAbout();
+});
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') closeAbout();
 });
 
 // ── Search ───────────────────────────────────────────────────────────────────
