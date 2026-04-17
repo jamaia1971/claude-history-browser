@@ -132,14 +132,34 @@ If you deploy this somewhere that isn't localhost (please don't), add authentica
 
 ---
 
+## Ideas for improvement — come help this thing thrive
+
+This app does the boring-but-useful stuff: open the files, list them, search them, export them. There is a lot of room to make it genuinely smart. If any of the ideas below sound fun, please fork it, prototype it, and open a PR — however rough. I'd rather merge a scrappy working idea than wait for a polished one that never ships.
+
+### AI-powered ideas
+
+- **Conversation memory / recap (Claude API).** Point the app at a conversation (or a whole batch), send the transcript to the Claude API, and get back a crisp recap: what the user was trying to do, what was tried, what worked, what was left open, and key decisions. Store the recap as a sidecar file (e.g. `<conversation-id>.recap.md`) so it's cached and re-openable without hitting the API again. Bonus: a "**rolling memory**" view that stitches recaps across many conversations into a living summary of what you've been working on lately.
+- **Smart search with skills.** Today search is plain string matching. With a small set of **skills** (Claude-style specialized prompts), the app could route queries intelligently — e.g. a `code-finder` skill for "find the bit where I debugged the Flask route", a `decision-tracker` skill for "when did I decide to use SQLite?", a `people-and-projects` skill for "what did I discuss with the legal team last month?". Each skill would know how to re-rank, summarize, and present results for its kind of question.
+- **Semantic search / embeddings.** Index every conversation with an embedding model so you can ask fuzzy questions ("that time I was fighting with CORS") without remembering exact words. Local embeddings are fine — no cloud needed.
+- **Auto-tagging and topic clustering.** Let the model read each conversation once and suggest tags (`#flask`, `#cowork`, `#bug-hunt`, `#refactor`), then cluster the sidebar by topic instead of just by project.
+- **Ask-your-history chat.** A small chat box that answers questions *about* your history — grounded in the actual conversations, with citations back to the source `.jsonl` files.
+- **Auto-detect resumable threads.** Flag conversations that ended mid-task so you can pick them back up, maybe with a one-click "continue this in Claude Code" button.
+
+### Plain-old-software ideas
+
+- Cross-platform folder picker (tkinter fallback, or PyWebview).
+- Tests — there are none yet. See *[About the author](#about-the-author)* for why.
+- Better sorting / advanced filters (date range, model, message count, conversation length).
+- Export to HTML or PDF, not just Markdown.
+- Virtualized list so people with thousands of conversations don't melt the browser.
+- Split the single-file app into modules (Flask blueprints, templates extracted from the `HTML_TEMPLATE` string, static assets as real files).
+- A proper package install (`pip install claude-history-browser`) with a console entry point.
+- Dark/light theme toggle.
+- Keyboard shortcuts for power users (`j`/`k` to move through conversations, `/` to focus search, etc.).
+
 ## Contributing
 
-Issues and PRs welcome, especially:
-- Cross-platform folder picker
-- Tests (there are none yet — see *[About the author](#about-the-author)*)
-- Better sorting / advanced filters (date range, model, length)
-- An option to export as a single HTML or PDF file in addition to Markdown
-- Virtualized list for folks with thousands of conversations
+Issues and PRs welcome. If any of the ideas above grab you, just go. If you're adding an AI feature, please keep it **opt-in** and **local-first** — the whole point of this app is that nothing leaves your machine by default. An AI recap that calls the Claude API is great, but it should be a clearly labeled choice, not a surprise.
 
 If you're going to touch the HTML template, it lives inside `claude_history_browser.py` as a single triple-quoted `HTML_TEMPLATE` string — not ideal, but it keeps the whole thing a single file. Extracting it is a fine PR if you want a proper structure.
 
