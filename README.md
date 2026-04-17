@@ -143,9 +143,11 @@ If you're going to touch the HTML template, it lives inside `claude_history_brow
 
 ## About the author
 
-I'm [Joao](https://github.com/jamaia1971). I'm a **vibe coder**. My "real" programming background is embarrassingly ancient — I wrote a lot of **BASIC** on 8-bit machines as a kid and some **Turbo Pascal** in school, and then I did approximately nothing for a few decades. I'm not a software engineer. I don't know Python idioms, I never learned Flask properly, and I picked up HTML/CSS by osmosis.
+I'm [@jamaia1971](https://github.com/jamaia1971). I'm a **vibe coder**. My "real" programming background is embarrassingly ancient and entirely self-taught: I wrote a lot of **BASIC** as a 12-year-old kid on an **Apple II Plus**, poked at a little **assembly** on the side, and later did some **Pascal** at university in the **PC/XT** era. I was the curious kid who opened up every computer I could get my hands on just to see what was inside, and I picked things up on my own by reading, tinkering, and breaking stuff until it worked again. Then adult life happened and I did approximately nothing programming-wise for a few decades.
 
-What I *can* do is describe what I want, read code, poke at it, and iterate. So everything you see here — the layout, the columns, the Markdown export, the history-scrubbing `.gitignore`, this README — is the product of me thinking out loud with Claude (the model), letting it write, reviewing the diff, asking for changes, and testing the result until it felt right. It's vibe coding in the truest sense: I steer, Claude drives, and we argue about the details until something useful falls out.
+Since LLMs came around I've been learning some **Python** on my own — and I'm brand new to **GitHub**, so I'm still fumbling through it and no doubt doing some foul things with branches, commits, and `.gitignore`s along the way. Bear with me.
+
+I'm not a software engineer. I don't know Python idioms, I never learned Flask properly, and I picked up HTML/CSS by osmosis. What I *can* do is describe what I want, read code, poke at it, and iterate. So everything you see here — the layout, the columns, the Markdown export, the history-scrubbing `.gitignore`, this README — is the product of me thinking out loud with Claude (the model), letting it write, reviewing the diff, asking for changes, and testing the result until it felt right. It's vibe coding in the truest sense: I steer, Claude drives, and we argue about the details until something useful falls out.
 
 If the code style feels inconsistent, if there are no tests, if error handling is thin, if something could clearly be 10× more elegant — that's why. I'm publishing this because *the thing works* and *the thing is useful to me*, and maybe it's useful to you too. If you're a real engineer and want to refactor it: please do, I'll happily merge.
 
@@ -153,7 +155,9 @@ If the code style feels inconsistent, if there are no tests, if error handling i
 
 ## License
 
-MIT. See [LICENSE](LICENSE) (add a LICENSE file if you fork — I intend to ship one).
+Released under the [MIT License](LICENSE) — copyright © 2026 [@jamaia1971](https://github.com/jamaia1971). In short: you can use, copy, modify, merge, and redistribute the code freely, as long as the copyright notice and the MIT license text travel with it. The software is provided "as is", with no warranty of any kind.
+
+This is a personal tool, not a product. I'm not shipping a packaged version, I have no roadmap, and I don't see any commercial use for it — it's here because it's useful to me and might be useful to someone else. If you want to fork it, rework it, or build something completely different on top of it, go ahead; that's exactly what MIT is for.
 
 ---
 

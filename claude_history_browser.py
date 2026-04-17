@@ -23,7 +23,7 @@ from pathlib import Path
 # ── App metadata (shown in the About dialog and MD export headers) ───────────
 APP_NAME = "Claude History Browser"
 APP_VERSION = "1.1.0"
-APP_AUTHOR = "Joao (@jamaia1971)"
+APP_AUTHOR = "@jamaia1971"
 APP_LICENSE = "MIT"
 APP_REPO = "https://github.com/jamaia1971/claude-history-browser"
 APP_COPYRIGHT = "Claude © Anthropic, PBC. This tool is an independent project and is not affiliated with Anthropic."
