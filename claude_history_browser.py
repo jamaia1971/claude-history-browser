@@ -22,11 +22,11 @@ from pathlib import Path
 
 # ── Try to import Flask, install if missing ─────────────────────────────────
 try:
-    from flask import Flask, jsonify, request, render_template_string
+    from flask import Flask, jsonify, request, render_template_string, Response
 except ImportError:
     print("📦 Installing Flask...")
     subprocess.check_call([sys.executable, "-m", "pip", "install", "flask", "--quiet"])
-    from flask import Flask, jsonify, request, render_template_string
+    from flask import Flask, jsonify, request, render_template_string, Response
 
 # ── Config ───────────────────────────────────────────────────────────────────
 CONFIG_FILE = Path.home() / ".claude_history_browser.json"
@@ -490,6 +490,130 @@ def api_config_change():
     return jsonify({"history_path": str(HISTORY_PATH)})
 
 
+# ── Markdown export ──────────────────────────────────────────────────────────
+def _md_escape_fence(text: str) -> str:
+    """Avoid breaking out of a fenced code block."""
+    return text.replace("```", "``\u200b`")
+
+
+def conversation_to_markdown(filepath: Path) -> str:
+    """Render a single .jsonl conversation as a Markdown document."""
+    summary = conversation_summary(filepath)
+    if not summary:
+        return ""
+
+    lines = []
+    lines.append(f"# {summary['title']}")
+    lines.append("")
+    lines.append(f"- **Project:** `{summary['project']}`")
+    if summary.get("first_ts"):
+        lines.append(f"- **Started:** {summary['first_ts']}")
+    if summary.get("last_ts"):
+        lines.append(f"- **Last turn:** {summary['last_ts']}")
+    lines.append(f"- **Messages:** {summary['user_count']} user · {summary['turn_count']} total")
+    lines.append(f"- **Model:** {summary['model']}")
+    lines.append(f"- **Source file:** `{summary['file']}`")
+    lines.append("")
+    lines.append("---")
+    lines.append("")
+
+    for m in parse_jsonl(filepath):
+        role = m.get("type")
+        if role not in ("user", "assistant"):
+            continue
+        blocks = content_blocks(m.get("message", {}).get("content", ""))
+        ts = m.get("timestamp") or ""
+        who = "👤 You" if role == "user" else "✦ Claude"
+        header = f"### {who}"
+        if ts:
+            header += f"  ·  `{ts}`"
+        lines.append(header)
+        lines.append("")
+
+        for b in blocks:
+            t = b.get("type")
+            if t == "text":
+                lines.append(b.get("text", ""))
+                lines.append("")
+            elif t == "thinking":
+                lines.append("<details><summary>🧠 Thinking</summary>")
+                lines.append("")
+                lines.append("```")
+                lines.append(_md_escape_fence(b.get("text", "")))
+                lines.append("```")
+                lines.append("")
+                lines.append("</details>")
+                lines.append("")
+            elif t == "tool_use":
+                lines.append(f"**🔧 Tool: `{b.get('name', '?')}`**")
+                lines.append("")
+                lines.append("```json")
+                lines.append(_md_escape_fence(b.get("input", "")))
+                lines.append("```")
+                lines.append("")
+            elif t == "tool_result":
+                lines.append("**📤 Tool result**")
+                lines.append("")
+                lines.append("```")
+                lines.append(_md_escape_fence(b.get("text", "")))
+                lines.append("```")
+                lines.append("")
+
+        lines.append("")
+
+    lines.append("---")
+    lines.append("")
+    return "\n".join(lines)
+
+
+@app.route("/api/download", methods=["POST"])
+def api_download():
+    """Bundle the selected conversations into a single Markdown file.
+
+    Request body: {"ids": ["<conv_id>", ...]}
+    """
+    body = request.get_json(silent=True) or {}
+    ids = body.get("ids") or []
+    if not isinstance(ids, list) or not ids:
+        return jsonify({"error": "No conversations selected"}), 400
+
+    # Build a quick lookup of {stem: path} so we don't rglob per-id
+    all_files = {f.stem: f for f in HISTORY_PATH.rglob("*.jsonl")}
+
+    parts = []
+    stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    parts.append(f"# Claude History Export")
+    parts.append("")
+    parts.append(f"- **Exported:** {stamp}")
+    parts.append(f"- **Conversations:** {len(ids)}")
+    parts.append("")
+    parts.append("---")
+    parts.append("")
+
+    missing = []
+    for cid in ids:
+        f = all_files.get(cid)
+        if not f:
+            missing.append(cid)
+            continue
+        md = conversation_to_markdown(f)
+        if md:
+            parts.append(md)
+
+    if missing:
+        parts.append("")
+        parts.append(f"> ⚠️ Could not find: {', '.join(missing)}")
+        parts.append("")
+
+    payload = "\n".join(parts)
+    filename = f"claude-history-{datetime.now().strftime('%Y%m%d-%H%M%S')}.md"
+    return Response(
+        payload,
+        mimetype="text/markdown; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
 # ── HTML / CSS / JS template ──────────────────────────────────────────────────
 HTML_TEMPLATE = r"""
 <!DOCTYPE html>
@@ -515,7 +639,7 @@ HTML_TEMPLATE = r"""
     --think-bg: #1a1e12;
     --result-bg: #121824;
     --radius: 10px;
-    --sidebar-w: 320px;
+    --sidebar-w: 620px;
   }
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 14px; height: 100vh; display: flex; flex-direction: column; }
@@ -533,21 +657,48 @@ HTML_TEMPLATE = r"""
   .body { display: flex; flex: 1; overflow: hidden; }
 
   /* ── Sidebar ── */
-  aside { width: var(--sidebar-w); min-width: var(--sidebar-w); background: var(--surface); border-right: 1px solid var(--border); display: flex; flex-direction: column; overflow: hidden; }
-  .sidebar-top { padding: 10px 12px; border-bottom: 1px solid var(--border); flex-shrink: 0; }
-  #project-select { width: 100%; background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 5px 8px; color: var(--text); font-size: 13px; cursor: pointer; }
+  aside { width: var(--sidebar-w); min-width: 420px; background: var(--surface); border-right: 1px solid var(--border); display: flex; flex-direction: column; overflow: hidden; }
+  .sidebar-top { padding: 10px 12px; border-bottom: 1px solid var(--border); flex-shrink: 0; display: flex; flex-direction: column; gap: 8px; }
+  .row { display: flex; align-items: center; gap: 8px; }
+  #project-select { flex: 1; background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 5px 8px; color: var(--text); font-size: 13px; cursor: pointer; }
+  #download-btn { background: var(--accent); color: #0f1117; border: none; border-radius: 6px; padding: 6px 12px; cursor: pointer; font-size: 12px; font-weight: 600; white-space: nowrap; }
+  #download-btn:disabled { background: var(--surface2); color: var(--text3); cursor: not-allowed; }
+  #download-btn:not(:disabled):hover { filter: brightness(1.1); }
+
+  /* ── Active filter pills ── */
+  .pills { display: flex; flex-wrap: wrap; gap: 6px; min-height: 0; }
+  .pill { background: var(--surface2); border: 1px solid var(--border); border-radius: 999px; padding: 3px 10px; font-size: 11px; color: var(--text2); display: inline-flex; align-items: center; gap: 6px; }
+  .pill .close { cursor: pointer; color: var(--text3); font-weight: 700; }
+  .pill .close:hover { color: var(--accent); }
+
+  /* ── Conversation table ── */
+  #conv-count { padding: 6px 14px; font-size: 11px; color: var(--text3); border-bottom: 1px solid var(--border); flex-shrink: 0; display: flex; justify-content: space-between; align-items: center; }
   #conv-list { flex: 1; overflow-y: auto; }
-  .conv-item { padding: 10px 14px; border-bottom: 1px solid var(--border); cursor: pointer; transition: background 0.15s; }
+  .col-header, .conv-item { display: grid; grid-template-columns: 28px 1fr 110px 150px; align-items: stretch; }
+  .col-header { background: var(--surface2); border-bottom: 1px solid var(--border); position: sticky; top: 0; z-index: 2; font-size: 10px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text3); }
+  .col-header > div { padding: 8px 10px; border-right: 1px solid var(--border); }
+  .col-header > div:last-child { border-right: 0; }
+  .conv-item { border-bottom: 1px solid var(--border); cursor: pointer; transition: background 0.15s; }
   .conv-item:hover { background: var(--surface2); }
-  .conv-item.active { background: var(--surface2); border-left: 3px solid var(--accent); }
+  .conv-item.active { background: var(--surface2); box-shadow: inset 3px 0 0 var(--accent); }
+  .conv-item > .cell { padding: 10px; border-right: 1px solid var(--border); overflow: hidden; }
+  .conv-item > .cell:last-child { border-right: 0; }
+  .cell-check { display: flex; align-items: center; justify-content: center; padding: 0 !important; }
+  .cell-check input[type="checkbox"] { width: 16px; height: 16px; cursor: pointer; accent-color: var(--accent); }
+  .cell-main { min-width: 0; }
   .conv-title { font-size: 13px; font-weight: 500; line-height: 1.4; color: var(--text); margin-bottom: 3px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .conv-meta { font-size: 11px; color: var(--text3); display: flex; gap: 8px; }
-  .conv-preview { font-size: 12px; color: var(--text2); margin-top: 3px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  #conv-count { padding: 6px 14px; font-size: 11px; color: var(--text3); border-bottom: 1px solid var(--border); flex-shrink: 0; }
+  .conv-preview { font-size: 12px; color: var(--text2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .conv-meta-sub { font-size: 10px; color: var(--text3); margin-top: 3px; }
+  .cell-date, .cell-project { font-size: 11px; color: var(--text2); display: flex; flex-direction: column; justify-content: center; }
+  .cell-date .date { color: var(--text); font-weight: 500; }
+  .cell-date .time { color: var(--text3); margin-top: 2px; }
+  .cell-project { color: var(--text); word-break: break-word; }
+  .filter-btn { background: transparent; border: 1px solid transparent; color: inherit; font: inherit; cursor: pointer; padding: 2px 4px; border-radius: 4px; text-align: left; width: 100%; }
+  .filter-btn:hover { background: var(--bg); border-color: var(--accent); color: var(--accent); }
 
   /* ── Main panel ── */
-  main { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
-  #welcome { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px; color: var(--text3); }
+  main { flex: 1; display: flex; flex-direction: column; overflow: hidden; min-width: 0; }
+  #welcome { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px; color: var(--text3); padding: 20px; text-align: center; }
   #welcome h2 { color: var(--text2); }
   #conv-view { flex: 1; overflow-y: auto; padding: 20px 24px; display: none; }
   #conv-header { padding: 12px 24px; background: var(--surface); border-bottom: 1px solid var(--border); flex-shrink: 0; display: none; }
@@ -585,9 +736,6 @@ HTML_TEMPLATE = r"""
   .sr-snippet { font-size: 12px; color: var(--text2); background: var(--surface2); border-radius: 4px; padding: 5px 8px; margin-top: 4px; white-space: pre-wrap; word-break: break-word; }
   .sr-snippet em { color: var(--accent); font-style: normal; font-weight: 600; }
 
-  /* ── Loader ── */
-  #loader { display: none; position: fixed; top: 50%; left: 50%; transform: translate(-50%,-50%); color: var(--text3); }
-
   /* ── Scrollbar ── */
   ::-webkit-scrollbar { width: 5px; }
   ::-webkit-scrollbar-track { background: transparent; }
@@ -605,16 +753,27 @@ HTML_TEMPLATE = r"""
 <div class="body">
   <aside>
     <div class="sidebar-top">
-      <select id="project-select"><option value="">All projects</option></select>
+      <div class="row">
+        <select id="project-select"><option value="">All projects</option></select>
+        <button id="download-btn" disabled>⬇︎ Download (0)</button>
+      </div>
+      <div id="filter-pills" class="pills"></div>
     </div>
     <div id="conv-count">Loading…</div>
+    <div class="col-header">
+      <div title="Select">☐</div>
+      <div>Conversation</div>
+      <div>Date &amp; Hour</div>
+      <div>Project</div>
+    </div>
     <div id="conv-list"></div>
   </aside>
 
   <main>
     <div id="welcome">
       <h2>Claude History Browser</h2>
-      <p>Select a conversation from the left, or search above.</p>
+      <p>Select a conversation from the left, or search above.<br/>
+      Check boxes on the left to bundle conversations into a single <code>.md</code> export.</p>
     </div>
     <div id="conv-header">
       <h2 id="ch-title"></h2>
@@ -625,12 +784,12 @@ HTML_TEMPLATE = r"""
   </main>
 </div>
 
-<div id="loader">Loading…</div>
-
 <script>
-let allConversations = [];
+let allConversations = [];   // raw results from server (already project-filtered server-side)
+let displayedConversations = []; // after client-side day filter
 let currentProject = '';
-let searchTimer = null;
+let dayFilter = '';          // yyyy-mm-dd (client side)
+let selected = new Set();    // conv ids selected for download
 
 // ── Init ─────────────────────────────────────────────────────────────────────
 async function init() {
@@ -645,7 +804,7 @@ async function loadProjects() {
   projects.forEach(p => {
     const opt = document.createElement('option');
     opt.value = p;
-    opt.textContent = p.replace(/^-/, '').replace(/-/g, '/');
+    opt.textContent = p;
     sel.appendChild(opt);
   });
   sel.addEventListener('change', () => {
@@ -663,26 +822,126 @@ async function loadConversations(q = '') {
 
   const res = await fetch(url);
   allConversations = await res.json();
-  renderList(allConversations);
+  applyFiltersAndRender();
+}
+
+function applyFiltersAndRender() {
+  let convs = allConversations.slice();
+  if (dayFilter) {
+    convs = convs.filter(c => {
+      const iso = c.last_ts || c.first_ts;
+      if (!iso) return false;
+      return iso.slice(0, 10) === dayFilter;
+    });
+  }
+  displayedConversations = convs;
+  renderList(convs);
+  renderPills();
+  updateDownloadBtn();
+}
+
+function renderPills() {
+  const pills = document.getElementById('filter-pills');
+  pills.innerHTML = '';
+  if (currentProject) {
+    pills.appendChild(mkPill(`project: ${currentProject}`, () => {
+      currentProject = '';
+      document.getElementById('project-select').value = '';
+      loadConversations();
+    }));
+  }
+  if (dayFilter) {
+    pills.appendChild(mkPill(`day: ${dayFilter}`, () => {
+      dayFilter = '';
+      applyFiltersAndRender();
+    }));
+  }
+}
+
+function mkPill(label, onClose) {
+  const el = document.createElement('span');
+  el.className = 'pill';
+  el.innerHTML = `${esc(label)} <span class="close" title="Clear">✕</span>`;
+  el.querySelector('.close').addEventListener('click', onClose);
+  return el;
 }
 
 function renderList(convs) {
   const list = document.getElementById('conv-list');
   const count = document.getElementById('conv-count');
-  count.textContent = convs.length + ' conversation' + (convs.length !== 1 ? 's' : '');
+  count.innerHTML = `<span>${convs.length} conversation${convs.length !== 1 ? 's' : ''}</span>`
+    + (selected.size ? `<span>${selected.size} selected</span>` : '');
   list.innerHTML = '';
   convs.forEach(c => {
     const div = document.createElement('div');
-    div.className = 'conv-item';
+    div.className = 'conv-item' + (selected.has(c.id) ? ' active-selected' : '');
     div.dataset.id = c.id;
-    const date = c.last_ts ? new Date(c.last_ts).toLocaleDateString('en-US', {month:'short',day:'numeric',year:'numeric'}) : '';
+    const iso = c.last_ts || c.first_ts || '';
+    const dayStr = iso ? iso.slice(0, 10) : '';
+    const d = iso ? new Date(iso) : null;
+    const dateDisp = d ? d.toLocaleDateString(undefined, {month:'short', day:'numeric', year:'numeric'}) : '—';
+    const timeDisp = d ? d.toLocaleTimeString(undefined, {hour:'2-digit', minute:'2-digit'}) : '';
+
     div.innerHTML = `
-      <div class="conv-title">${esc(c.title)}</div>
-      <div class="conv-meta"><span>${date}</span><span>${c.user_count} msgs</span><span>${c.model || ''}</span></div>
-      <div class="conv-preview">${esc(c.preview)}</div>`;
+      <div class="cell cell-check">
+        <input type="checkbox" ${selected.has(c.id) ? 'checked' : ''} />
+      </div>
+      <div class="cell cell-main">
+        <div class="conv-title">${esc(c.title)}</div>
+        <div class="conv-preview">${esc(c.preview)}</div>
+        <div class="conv-meta-sub">${c.user_count} msgs · ${esc(c.model || '')}</div>
+      </div>
+      <div class="cell cell-date">
+        <button class="filter-btn" data-day="${dayStr}" title="Filter to this day">
+          <div class="date">${dateDisp}</div>
+          <div class="time">${timeDisp}</div>
+        </button>
+      </div>
+      <div class="cell cell-project">
+        <button class="filter-btn" data-project="${esc(c.project)}" title="Filter to this project">${esc(c.project)}</button>
+      </div>`;
+
+    // Checkbox handler
+    const cb = div.querySelector('input[type="checkbox"]');
+    cb.addEventListener('click', (e) => e.stopPropagation());
+    cb.addEventListener('change', () => {
+      if (cb.checked) selected.add(c.id);
+      else selected.delete(c.id);
+      updateDownloadBtn();
+      const countEl = document.getElementById('conv-count');
+      countEl.innerHTML = `<span>${convs.length} conversation${convs.length !== 1 ? 's' : ''}</span>`
+        + (selected.size ? `<span>${selected.size} selected</span>` : '');
+    });
+
+    // Date filter
+    const dayBtn = div.querySelector('[data-day]');
+    dayBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      if (!dayStr) return;
+      dayFilter = dayStr;
+      applyFiltersAndRender();
+    });
+
+    // Project filter
+    const projBtn = div.querySelector('[data-project]');
+    projBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      currentProject = c.project;
+      document.getElementById('project-select').value = c.project;
+      loadConversations();
+    });
+
+    // Row click → open conversation
     div.addEventListener('click', () => openConversation(c));
+
     list.appendChild(div);
   });
+}
+
+function updateDownloadBtn() {
+  const btn = document.getElementById('download-btn');
+  btn.textContent = `⬇︎ Download (${selected.size})`;
+  btn.disabled = selected.size === 0;
 }
 
 // ── Open conversation ────────────────────────────────────────────────────────
@@ -751,6 +1010,44 @@ function renderConversation(turns, container) {
   container.scrollTop = 0;
 }
 
+// ── Download selected as Markdown ────────────────────────────────────────────
+document.getElementById('download-btn').addEventListener('click', async () => {
+  if (!selected.size) return;
+  const btn = document.getElementById('download-btn');
+  const originalText = btn.textContent;
+  btn.textContent = 'Preparing…';
+  btn.disabled = true;
+
+  try {
+    const res = await fetch('/api/download', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ids: [...selected]}),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({error: 'Download failed'}));
+      alert(err.error || 'Download failed');
+      return;
+    }
+    const blob = await res.blob();
+    const dispo = res.headers.get('Content-Disposition') || '';
+    const m = dispo.match(/filename="([^"]+)"/);
+    const filename = m ? m[1] : 'claude-history.md';
+
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  } finally {
+    btn.textContent = originalText;
+    btn.disabled = selected.size === 0;
+  }
+});
+
 // ── Search ───────────────────────────────────────────────────────────────────
 document.getElementById('search-global').addEventListener('keydown', async (e) => {
   if (e.key !== 'Enter') return;
@@ -813,7 +1110,7 @@ document.getElementById('path-btn').addEventListener('click', async () => {
     'Enter 1 or 2:',
     '1'
   );
-  if (choice === null) return; // cancelled
+  if (choice === null) return;
 
   let body;
   if (choice.trim() === '2') {
@@ -842,7 +1139,7 @@ document.getElementById('path-btn').addEventListener('click', async () => {
 
 // ── Utils ─────────────────────────────────────────────────────────────────────
 function esc(s) {
-  if (!s) return '';
+  if (s === null || s === undefined) return '';
   return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
 
