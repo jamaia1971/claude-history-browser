@@ -70,6 +70,8 @@ Flask is installed automatically on first run if you don't already have it.
 
 Each subfolder becomes a "project" in the UI. Each `.jsonl` becomes a conversation.
 
+> ⚠️ **Claude Code auto-deletes local history after 30 days by default.** This browser can only show what's still on disk, so if you care about long-term scrollback, take a minute to raise `cleanupPeriodDays` in `~/.claude/settings.json` — or archive the folder elsewhere. See **[HISTORY_RETENTION.md](HISTORY_RETENTION.md)** for a full explanation, the one config tweak that matters, and a ready-to-use archive recipe.
+
 ---
 
 ## How to use it

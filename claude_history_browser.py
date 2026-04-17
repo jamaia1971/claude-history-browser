@@ -12,6 +12,7 @@ The path is saved to ~/.claude_history_browser.json for future sessions.
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import threading
@@ -43,13 +44,26 @@ HISTORY_PATH: Path = None  # set at startup
 
 
 # ── Folder picker (macOS Finder) ─────────────────────────────────────────────
-def pick_folder_mac():
-    script = '''
+def pick_folder_mac(prompt_text: str = None):
+    """Open a macOS Finder "choose folder" dialog and return the POSIX path.
+
+    An optional custom ``prompt_text`` can be passed so the same helper can
+    serve both "pick your history folder" and "pick a backup destination" flows.
+    """
+    if not prompt_text:
+        prompt_text = (
+            "Select your Claude history folder "
+            "(the folder containing project subfolders with .jsonl files):"
+        )
+    # AppleScript uses double quotes for strings; escape any embedded quotes
+    # and backslashes in the caller-supplied prompt to keep the script valid.
+    safe_prompt = prompt_text.replace("\\", "\\\\").replace('"', '\\"')
+    script = f'''
     tell application "Finder"
         activate
     end tell
     try
-        set chosen to choose folder with prompt "Select your Claude history folder (the folder containing project subfolders with .jsonl files):"
+        set chosen to choose folder with prompt "{safe_prompt}"
         return POSIX path of chosen
     on error
         return ""
@@ -799,6 +813,140 @@ def api_download():
     )
 
 
+# ── Back-up (copy the whole history folder tree to a safe location) ──────────
+def _human_size(num_bytes: int) -> str:
+    """Render a byte count as a human-readable string (e.g. '12.4 MB')."""
+    size = float(num_bytes)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if size < 1024.0 or unit == "TB":
+            return f"{size:.1f} {unit}" if unit != "B" else f"{int(size)} {unit}"
+        size /= 1024.0
+    return f"{size:.1f} TB"
+
+
+def _copy_history_tree(src: Path, dst: Path):
+    """Recursively copy ``src`` → ``dst``, returning (files, bytes) counters.
+
+    Uses shutil.copy2 to preserve timestamps so the backup still reflects when
+    each original conversation was recorded. Symlinks are followed (we want a
+    real, self-contained copy). Files that fail to copy are collected and
+    reported so one bad permission doesn't abort the whole run.
+    """
+    files_copied = 0
+    bytes_copied = 0
+    errors = []
+
+    dst.mkdir(parents=True, exist_ok=True)
+    for root, dirs, files in os.walk(src, followlinks=True):
+        rel = Path(root).relative_to(src)
+        target_dir = dst / rel
+        target_dir.mkdir(parents=True, exist_ok=True)
+        for name in files:
+            src_file = Path(root) / name
+            dst_file = target_dir / name
+            try:
+                shutil.copy2(src_file, dst_file)
+                files_copied += 1
+                try:
+                    bytes_copied += src_file.stat().st_size
+                except OSError:
+                    pass
+            except Exception as exc:  # keep going even on unreadable files
+                errors.append(f"{src_file}: {exc}")
+
+    return files_copied, bytes_copied, errors
+
+
+@app.route("/api/backup", methods=["POST"])
+def api_backup():
+    """Copy the entire history folder to a user-chosen destination.
+
+    The goal is to protect conversations from being wiped by system cleanup
+    or by a Claude app maintenance / update routine. We copy HISTORY_PATH
+    into a timestamped subfolder under the chosen destination, so repeated
+    backups to the same folder don't overwrite each other.
+
+    Request body (JSON, all optional):
+      - "mode": "finder" (default) or "path"
+      - "path": destination folder (required when mode == "path")
+    """
+    if HISTORY_PATH is None or not HISTORY_PATH.exists():
+        return jsonify({"error": "History folder is not configured."}), 400
+
+    body = request.get_json(silent=True) or {}
+    mode = (body.get("mode") or "finder").lower()
+
+    if mode == "path":
+        raw = body.get("path", "")
+        cleaned = normalize_path_input(raw)
+        if not cleaned:
+            return jsonify({"error": "Empty destination path"}), 400
+        dest_root = Path(cleaned)
+        if not dest_root.exists():
+            return jsonify({"error": f"Destination does not exist: {dest_root}"}), 400
+        if not dest_root.is_dir():
+            return jsonify({"error": f"Destination is not a folder: {dest_root}"}), 400
+    else:
+        chosen = pick_folder_mac(
+            "Choose a folder to back up your Claude history into "
+            "(a timestamped subfolder will be created there):"
+        )
+        if not chosen:
+            return jsonify({"error": "No destination folder selected"}), 400
+        dest_root = Path(chosen)
+
+    # Refuse to back up inside the source folder — that would create an
+    # ever-growing nested copy and could recurse through the walk.
+    try:
+        dest_resolved = dest_root.resolve()
+        src_resolved = HISTORY_PATH.resolve()
+        if dest_resolved == src_resolved or src_resolved in dest_resolved.parents:
+            return jsonify({
+                "error": (
+                    "Destination is inside the history folder. "
+                    "Please pick a location outside of it."
+                )
+            }), 400
+    except Exception:
+        pass  # best-effort safety check; continue if resolution fails
+
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    backup_name = f"claude-history-backup-{stamp}"
+    backup_dir = dest_root / backup_name
+
+    try:
+        files_copied, bytes_copied, errors = _copy_history_tree(HISTORY_PATH, backup_dir)
+    except Exception as exc:
+        return jsonify({"error": f"Backup failed: {exc}"}), 500
+
+    # Drop a small manifest so the user can tell what this backup is later.
+    try:
+        manifest = {
+            "generator": f"{APP_NAME} v{APP_VERSION}",
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+            "source": str(HISTORY_PATH),
+            "destination": str(backup_dir),
+            "files_copied": files_copied,
+            "bytes_copied": bytes_copied,
+            "errors": errors[:50],  # cap so the manifest stays small
+            "notice": APP_COPYRIGHT,
+        }
+        (backup_dir / "BACKUP_INFO.json").write_text(
+            json.dumps(manifest, indent=2), encoding="utf-8"
+        )
+    except Exception:
+        pass  # manifest is nice-to-have, not essential
+
+    return jsonify({
+        "destination": str(backup_dir),
+        "files_copied": files_copied,
+        "bytes_copied": bytes_copied,
+        "bytes_human": _human_size(bytes_copied),
+        "errors": errors,
+        "error_count": len(errors),
+    })
+
+
 # ── HTML / CSS / JS template ──────────────────────────────────────────────────
 HTML_TEMPLATE = r"""
 <!DOCTYPE html>
@@ -881,6 +1029,28 @@ HTML_TEMPLATE = r"""
   #copy-btn:disabled { color: var(--text3); border-color: var(--border); cursor: not-allowed; opacity: 0.55; }
   #copy-btn:not(:disabled):hover { background: var(--accent2); color: #0f1117; }
   #copy-btn.copied { background: #2f8a4e; border-color: #2f8a4e; color: #fff; }
+  /* Back-up button: uses a warm/amber tone so it reads as a "safety" action,
+     visually distinct from download (accent) and copy (accent2). It's always
+     enabled because backing up doesn't require any selection. */
+  #backup-btn { background: transparent; color: #f0b45a; border: 1px solid #c88a3a; }
+  #backup-btn:not(:disabled):hover { background: #f0b45a; color: #0f1117; border-color: #f0b45a; }
+  #backup-btn:disabled { color: var(--text3); border-color: var(--border); cursor: not-allowed; opacity: 0.55; }
+  #backup-btn.backed-up { background: #2f8a4e; border-color: #2f8a4e; color: #fff; }
+
+  /* ── Backup result modal ── */
+  #backup-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,0.55); display: none; align-items: center; justify-content: center; z-index: 120; }
+  #backup-backdrop.open { display: flex; }
+  #backup-modal { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; max-width: 560px; width: calc(100% - 32px); padding: 22px 24px; box-shadow: 0 12px 48px rgba(0,0,0,0.5); color: var(--text); }
+  #backup-modal h2 { font-size: 17px; color: #f0b45a; margin-bottom: 6px; }
+  #backup-modal .bm-sub { font-size: 12px; color: var(--text3); margin-bottom: 14px; line-height: 1.5; }
+  #backup-modal dl { display: grid; grid-template-columns: 130px 1fr; gap: 6px 12px; font-size: 13px; margin-bottom: 14px; }
+  #backup-modal dt { color: var(--text3); }
+  #backup-modal dd { color: var(--text); word-break: break-all; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+  #backup-modal .bm-errors { background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px; max-height: 160px; overflow-y: auto; font-size: 11px; color: #e89393; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; word-break: break-all; }
+  #backup-modal .bm-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 14px; }
+  #backup-modal button { border: 0; border-radius: 6px; padding: 6px 14px; cursor: pointer; font-weight: 600; font-size: 13px; }
+  #backup-modal .bm-close { background: var(--accent); color: #0f1117; }
+  #backup-modal .bm-close:hover { filter: brightness(1.1); }
 
   /* ── Splitter / resizer between sidebar and main ── */
   .splitter {
@@ -1008,6 +1178,28 @@ HTML_TEMPLATE = r"""
   </div>
 </div>
 
+<!-- Backup result modal -->
+<div id="backup-backdrop" role="dialog" aria-modal="true" aria-labelledby="backup-title">
+  <div id="backup-modal">
+    <h2 id="backup-title">🛟 Backup complete</h2>
+    <div class="bm-sub" id="backup-sub">Your history folder has been copied to a safe location.</div>
+    <dl>
+      <dt>Destination</dt><dd id="backup-dest">—</dd>
+      <dt>Files copied</dt><dd id="backup-files">—</dd>
+      <dt>Total size</dt><dd id="backup-size">—</dd>
+    </dl>
+    <div id="backup-errors-wrap" style="display:none;">
+      <div style="font-size:12px;color:var(--text3);margin-bottom:4px;">
+        <span id="backup-errors-count">0</span> file(s) could not be copied:
+      </div>
+      <div class="bm-errors" id="backup-errors"></div>
+    </div>
+    <div class="bm-actions">
+      <button id="backup-close" class="bm-close" type="button">Close</button>
+    </div>
+  </div>
+</div>
+
 <div class="body">
   <aside>
     <div class="sidebar-top">
@@ -1017,6 +1209,7 @@ HTML_TEMPLATE = r"""
       <div class="action-row">
         <button id="download-btn" class="action-btn" disabled title="Download the selected conversations as a single .md file">⬇︎ Download (0)</button>
         <button id="copy-btn" class="action-btn" disabled title="Copy the selected conversations to the clipboard as Markdown">⧉ Copy (0)</button>
+        <button id="backup-btn" class="action-btn" title="Back up the entire history folder to another location so it survives system cleanups or Claude app updates">🛟 Back-up</button>
       </div>
       <div id="filter-pills" class="pills"></div>
     </div>
@@ -1615,6 +1808,119 @@ document.getElementById('copy-btn').addEventListener('click', () => {
   })();
 });
 
+// ── Back-up the whole history folder ────────────────────────────────────────
+//
+// Unlike Download / Copy, which act on the *selected* conversations, Back-up
+// copies the ENTIRE history folder tree to a user-chosen destination. The
+// goal is to shield the user's conversations from a system cleanup or from
+// Claude app maintenance/update routines that might delete or overwrite
+// local history files.
+//
+// The user picks the destination folder either via a native Finder dialog
+// (macOS) or by typing/pasting the full path. The server then creates a
+// timestamped subfolder there (so repeated backups to the same location
+// coexist instead of overwriting each other) and recursively copies the
+// history into it.
+function showBackupResult(info) {
+  document.getElementById('backup-dest').textContent = info.destination || '—';
+  document.getElementById('backup-files').textContent =
+    (info.files_copied != null ? info.files_copied : '—') + ' file(s)';
+  document.getElementById('backup-size').textContent = info.bytes_human || '—';
+
+  const wrap = document.getElementById('backup-errors-wrap');
+  const list = document.getElementById('backup-errors');
+  const count = document.getElementById('backup-errors-count');
+  const errs = info.errors || [];
+  if (errs.length) {
+    wrap.style.display = 'block';
+    count.textContent = info.error_count != null ? info.error_count : errs.length;
+    list.textContent = errs.slice(0, 50).join('\n');
+  } else {
+    wrap.style.display = 'none';
+  }
+
+  document.getElementById('backup-backdrop').classList.add('open');
+}
+
+function closeBackupModal() {
+  document.getElementById('backup-backdrop').classList.remove('open');
+}
+
+document.getElementById('backup-close').addEventListener('click', closeBackupModal);
+document.getElementById('backup-backdrop').addEventListener('click', (e) => {
+  if (e.target.id === 'backup-backdrop') closeBackupModal();
+});
+
+document.getElementById('backup-btn').addEventListener('click', async () => {
+  const btn = document.getElementById('backup-btn');
+
+  // Ask the user how they want to choose the destination. The same two-mode
+  // pattern is used by the "Change folder" button for consistency.
+  const choice = prompt(
+    'Back up your Claude history folder to another location so it\'s not\n' +
+    'wiped by a system cleanup or by a Claude app maintenance/update routine.\n\n' +
+    'How would you like to pick the destination folder?\n\n' +
+    '  1 = open a Finder window to pick it\n' +
+    '  2 = type or paste the full folder path\n\n' +
+    'Enter 1 or 2:',
+    '1'
+  );
+  if (choice === null) return;
+
+  let body;
+  if (choice.trim() === '2') {
+    const pasted = prompt(
+      'Paste the full path to the folder where the backup should be saved\n' +
+      '(a timestamped subfolder will be created inside it):'
+    );
+    if (!pasted || !pasted.trim()) return;
+    body = {mode: 'path', path: pasted};
+  } else {
+    body = {mode: 'finder'};
+  }
+
+  const originalText = btn.textContent;
+  btn.textContent = 'Backing up…';
+  btn.disabled = true;
+
+  try {
+    const res = await fetch('/api/backup', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) {
+      let msg = 'Backup failed';
+      try { msg = (await res.json()).error || msg; } catch (_) {}
+      alert(msg);
+      return;
+    }
+    const info = await res.json();
+
+    // Transient "✓ Backed up" flash on the button, then settle back to idle.
+    btn.classList.add('backed-up');
+    btn.textContent = '✓ Backed up';
+    setTimeout(() => {
+      btn.classList.remove('backed-up');
+      btn.textContent = originalText;
+      btn.disabled = false;
+    }, 1800);
+
+    showBackupResult(info);
+  } catch (e) {
+    alert((e && e.message) || 'Backup failed');
+    btn.textContent = originalText;
+    btn.disabled = false;
+  } finally {
+    // Safety: make sure the button is re-enabled even if the flash callback
+    // above didn't run (e.g. error path).
+    if (!btn.classList.contains('backed-up')) {
+      btn.textContent = originalText;
+      btn.disabled = false;
+    }
+  }
+});
+
 // ── About dialog ─────────────────────────────────────────────────────────────
 let aboutLoaded = false;
 async function openAbout() {
@@ -1647,7 +1953,7 @@ document.getElementById('about-backdrop').addEventListener('click', (e) => {
   if (e.target.id === 'about-backdrop') closeAbout();
 });
 document.addEventListener('keydown', (e) => {
-  if (e.key === 'Escape') closeAbout();
+  if (e.key === 'Escape') { closeAbout(); closeBackupModal(); }
 });
 
 // ── Search ───────────────────────────────────────────────────────────────────
