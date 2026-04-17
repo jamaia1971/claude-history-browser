@@ -52,6 +52,78 @@ def pick_folder_mac():
     return path if path else None
 
 
+def normalize_path_input(raw: str) -> str | None:
+    """Clean a path string the user typed or pasted.
+
+    Handles quotes, leading/trailing whitespace, ~ expansion, and shell-style
+    escaped spaces (e.g. /Users/joao/My\\ Folder). Returns None if empty.
+    """
+    if not raw:
+        return None
+    s = raw.strip()
+    # Strip surrounding quotes
+    if (s.startswith('"') and s.endswith('"')) or (
+        s.startswith("'") and s.endswith("'")
+    ):
+        s = s[1:-1]
+    # Undo shell-escaped spaces like "My\ Folder"
+    s = s.replace("\\ ", " ")
+    s = os.path.expanduser(s)
+    return s or None
+
+
+def prompt_folder_path() -> str | None:
+    """Ask the user for a history folder via Finder OR typed/pasted path.
+
+    Loops until a valid existing directory is supplied, or the user aborts
+    by entering 'q' / pressing Ctrl+C.
+    """
+    print(
+        "\nHow would you like to choose your Claude history folder?\n"
+        "  [1] Open a Finder window to pick it\n"
+        "  [2] Type or paste the folder path\n"
+        "  [q] Quit\n"
+    )
+    while True:
+        try:
+            choice = input("Your choice [1/2/q]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return None
+
+        if choice in ("q", "quit", "exit"):
+            return None
+
+        if choice in ("", "1", "finder", "f"):
+            print("🔍 Opening Finder...")
+            chosen = pick_folder_mac()
+            if chosen and Path(chosen).is_dir():
+                return chosen
+            print("⚠️  No folder selected via Finder. Try again.")
+            continue
+
+        if choice in ("2", "paste", "p", "path"):
+            try:
+                raw = input("Paste the full path to your history folder: ")
+            except (EOFError, KeyboardInterrupt):
+                print()
+                return None
+            cleaned = normalize_path_input(raw)
+            if not cleaned:
+                print("⚠️  Empty path. Try again.")
+                continue
+            p = Path(cleaned)
+            if not p.exists():
+                print(f"⚠️  Path does not exist: {p}")
+                continue
+            if not p.is_dir():
+                print(f"⚠️  Not a folder: {p}")
+                continue
+            return str(p)
+
+        print("⚠️  Please enter 1, 2, or q.")
+
+
 # ── Config persistence ───────────────────────────────────────────────────────
 def load_config():
     if CONFIG_FILE.exists():
@@ -77,8 +149,7 @@ def resolve_history_path() -> Path:
         else:
             print(f"⚠️  Saved path no longer exists: {p}")
 
-    print("🔍 Opening Finder to select your Claude history folder...")
-    chosen = pick_folder_mac()
+    chosen = prompt_folder_path()
     if not chosen:
         print("❌ No folder selected. Exiting.")
         sys.exit(1)
@@ -181,6 +252,24 @@ def parse_ts(ts_str):
         return None
 
 
+def project_key(filepath: Path) -> str:
+    """Return the project identifier for a .jsonl file.
+
+    This is the path of the file's parent directory relative to HISTORY_PATH,
+    so nested subfolders produce distinct project names (e.g. "foo/bar").
+    Files directly in HISTORY_PATH get the project name "(root)".
+    """
+    try:
+        rel = filepath.parent.relative_to(HISTORY_PATH)
+    except Exception:
+        return filepath.parent.name
+    s = str(rel)
+    if s in ("", "."):
+        return "(root)"
+    # Normalize to forward slashes for display
+    return s.replace(os.sep, "/")
+
+
 def conversation_summary(filepath: Path) -> dict | None:
     messages = parse_jsonl(filepath)
     if not messages:
@@ -214,7 +303,7 @@ def conversation_summary(filepath: Path) -> dict | None:
     return {
         "id": filepath.stem,
         "file": str(filepath),
-        "project": filepath.parent.name,
+        "project": project_key(filepath),
         "title": title,
         "preview": preview,
         "turn_count": len(turns),
@@ -234,47 +323,47 @@ def index():
 
 @app.route("/api/projects")
 def api_projects():
-    """Return list of projects (subdirectory names)."""
-    projects = sorted(
-        [d.name for d in HISTORY_PATH.iterdir() if d.is_dir()],
-        key=lambda x: x.lower(),
-    )
-    return jsonify(projects)
+    """Return list of projects — every directory (at any depth) that
+    contains .jsonl files, relative to HISTORY_PATH."""
+    projects = set()
+    for f in HISTORY_PATH.rglob("*.jsonl"):
+        projects.add(project_key(f))
+    return jsonify(sorted(projects, key=lambda x: x.lower()))
 
 
 @app.route("/api/conversations")
 def api_conversations():
-    """Return summaries of all conversations, optionally filtered by project."""
+    """Return summaries of all conversations, optionally filtered by project.
+
+    Scans HISTORY_PATH recursively so conversations in nested subfolders
+    are included.
+    """
     project_filter = request.args.get("project", "")
     search = request.args.get("q", "").lower()
 
-    results = []
-    search_dirs = (
-        [HISTORY_PATH / project_filter]
-        if project_filter
-        else [d for d in HISTORY_PATH.iterdir() if d.is_dir()]
-    )
-    # Also check root-level jsonl files
-    search_dirs.append(HISTORY_PATH)
+    # Gather candidate files recursively, then filter by project if requested.
+    all_files = list(HISTORY_PATH.rglob("*.jsonl"))
+    if project_filter:
+        all_files = [f for f in all_files if project_key(f) == project_filter]
 
-    for d in search_dirs:
-        if not d.exists():
+    # Sort newest first
+    all_files.sort(key=lambda x: x.stat().st_mtime, reverse=True)
+
+    results = []
+    for f in all_files:
+        summary = conversation_summary(f)
+        if not summary:
             continue
-        pattern = "*.jsonl" if d == HISTORY_PATH else "*.jsonl"
-        for f in sorted(d.glob(pattern), key=lambda x: x.stat().st_mtime, reverse=True):
-            summary = conversation_summary(f)
-            if not summary:
-                continue
-            if search and search not in (summary["title"] + summary["preview"]).lower():
-                # Deep search: scan file content
-                try:
-                    raw = f.read_text(errors="replace")
-                    if search not in raw.lower():
-                        continue
-                    summary["_matched_content"] = True
-                except Exception:
+        if search and search not in (summary["title"] + summary["preview"]).lower():
+            # Deep search: scan file content
+            try:
+                raw = f.read_text(errors="replace")
+                if search not in raw.lower():
                     continue
-            results.append(summary)
+                summary["_matched_content"] = True
+            except Exception:
+                continue
+        results.append(summary)
 
     return jsonify(results)
 
@@ -367,10 +456,32 @@ def api_config():
 
 @app.route("/api/config/change", methods=["POST"])
 def api_config_change():
-    """Let user pick a new folder at runtime."""
-    chosen = pick_folder_mac()
-    if not chosen:
-        return jsonify({"error": "No folder selected"}), 400
+    """Let user pick a new folder at runtime.
+
+    Two modes:
+      - {"mode": "finder"}  → open a Finder window to pick a folder
+      - {"mode": "path", "path": "/abs/path"}  → use the supplied path directly
+    If no body is supplied, defaults to Finder for backward compatibility.
+    """
+    body = request.get_json(silent=True) or {}
+    mode = (body.get("mode") or "finder").lower()
+
+    if mode == "path":
+        raw = body.get("path", "")
+        cleaned = normalize_path_input(raw)
+        if not cleaned:
+            return jsonify({"error": "Empty path"}), 400
+        p = Path(cleaned)
+        if not p.exists():
+            return jsonify({"error": f"Path does not exist: {p}"}), 400
+        if not p.is_dir():
+            return jsonify({"error": f"Not a folder: {p}"}), 400
+        chosen = str(p)
+    else:
+        chosen = pick_folder_mac()
+        if not chosen:
+            return jsonify({"error": "No folder selected"}), 400
+
     global HISTORY_PATH
     HISTORY_PATH = Path(chosen)
     cfg = load_config()
@@ -695,11 +806,37 @@ function showConvPanel() {
 
 // ── Change folder ────────────────────────────────────────────────────────────
 document.getElementById('path-btn').addEventListener('click', async () => {
-  const res = await fetch('/api/config/change', {method: 'POST'});
+  const choice = prompt(
+    'How would you like to set the history folder?\n\n' +
+    '  1 = open a Finder window to pick it\n' +
+    '  2 = type or paste the full folder path\n\n' +
+    'Enter 1 or 2:',
+    '1'
+  );
+  if (choice === null) return; // cancelled
+
+  let body;
+  if (choice.trim() === '2') {
+    const pasted = prompt('Paste the full path to your history folder:');
+    if (!pasted || !pasted.trim()) return;
+    body = {mode: 'path', path: pasted};
+  } else {
+    body = {mode: 'finder'};
+  }
+
+  const res = await fetch('/api/config/change', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(body),
+  });
   if (res.ok) {
     const cfg = await res.json();
     alert('Folder changed to:\n' + cfg.history_path);
     location.reload();
+  } else {
+    let msg = 'Could not change folder.';
+    try { msg = (await res.json()).error || msg; } catch (_) {}
+    alert(msg);
   }
 });
 
