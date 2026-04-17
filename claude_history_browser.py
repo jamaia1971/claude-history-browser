@@ -12,12 +12,13 @@ The path is saved to ~/.claude_history_browser.json for future sessions.
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 import threading
 import webbrowser
-from collections import defaultdict
+from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -274,9 +275,25 @@ def parse_ts(ts_str):
         return None
 
 
-# Cache of per-folder "pretty" project names keyed by the parent directory,
-# so we don't re-scan a jsonl file every time we need a display name.
-_PROJECT_NAME_CACHE: dict[str, str] = {}
+# Cache of per-folder project info keyed by the parent directory, so we don't
+# re-scan jsonl files every time we need a display name. Each value is a dict
+# {"display": str, "session": str | None} — where "session" is the Cowork
+# session nickname (e.g. "vigilant-keen-davinci") when one can be detected
+# from the conversation's cwd / paths, and "display" is the best human-facing
+# label to put in the Project column (the mounted folder name if we can find
+# one, otherwise just the cwd basename).
+_PROJECT_INFO_CACHE: dict[str, dict] = {}
+
+# Cowork session nicknames follow an adjective-adjective-noun pattern like
+# "vigilant-keen-davinci" or "epic-intelligent-fermat" (animal/scientist name
+# at the end). Matching this lets us decide when to dig deeper for the real
+# mounted project folder instead of showing the nickname.
+_COWORK_SESSION_PATTERN = re.compile(r"^[a-z][a-z]+-[a-z][a-z]+-[a-z][a-z]+$")
+
+# Matches "/sessions/<nickname>/mnt/<folder>" inside any string. Group 1 is
+# the session nickname; group 2 is the mounted folder name (which can contain
+# spaces — we stop at the next slash, quote, or backslash).
+_COWORK_MOUNT_REGEX = re.compile(r"/sessions/([^/\"\\\s]+)/mnt/([^/\"\\]+)")
 
 
 def _extract_cwd_from_jsonl(filepath: Path) -> str | None:
@@ -319,28 +336,79 @@ def _decode_claude_folder_name(name: str) -> str:
     return name.replace("-", "/")
 
 
-def project_display_name(filepath: Path) -> str:
-    """Return a human-friendly project name for a .jsonl file.
+def _looks_like_cowork_session(name: str) -> bool:
+    """True if `name` matches the Cowork session-nickname pattern."""
+    return bool(_COWORK_SESSION_PATTERN.match(name or ""))
 
-    Order of preference:
-      1. The basename of the `cwd` field recorded inside the .jsonl file
-         (this is the actual project folder the user was working in).
-      2. The decoded folder name on disk (best-effort, lossy).
-      3. The raw folder name.
-    Files directly in HISTORY_PATH get "(root)".
+
+def _scan_cowork_mount(parent: Path) -> tuple[str | None, str | None]:
+    """Scan a few early JSONL lines in ``parent`` for ``/sessions/X/mnt/Y``
+    style paths and return the most common ``(mount_folder, session_name)``.
+
+    When a conversation ran inside a Cowork session with a user-selected
+    workspace folder, tool-call arguments and file paths typically reference
+    ``/sessions/<nickname>/mnt/<real-folder>/...``. Counting those and
+    picking the most-seen ``<real-folder>`` gives us the actual project the
+    user was working in — something much friendlier than the session
+    nickname (e.g. "history browser" instead of "epic-intelligent-fermat").
+    """
+    mount_counts = Counter()
+    mount_to_session: dict[str, str] = {}
+    try:
+        files = sorted(parent.glob("*.jsonl"))[:5]  # cap I/O for big folders
+    except Exception:
+        return None, None
+
+    for f in files:
+        try:
+            with open(f, encoding="utf-8", errors="replace") as fh:
+                for i, line in enumerate(fh):
+                    if i >= 40:  # first 40 lines usually contain the cwd
+                        break    # and the system-prompt with the folder path
+                    for m in _COWORK_MOUNT_REGEX.finditer(line):
+                        sess = m.group(1)
+                        mount = m.group(2).strip().strip("/")
+                        # Skip hidden/plumbing folders like .claude, .local-plugins
+                        if not mount or mount.startswith(".") or mount.startswith("tmp"):
+                            continue
+                        mount_counts[mount] += 1
+                        mount_to_session.setdefault(mount, sess)
+        except Exception:
+            continue
+
+    if not mount_counts:
+        return None, None
+    best = mount_counts.most_common(1)[0][0]
+    return best, mount_to_session.get(best)
+
+
+def project_info(filepath: Path) -> dict:
+    """Return ``{"display": str, "session": str | None}`` for a jsonl file.
+
+    Preference order for ``display``:
+      1. If the jsonl's ``cwd`` looks like a Cowork session root
+         (basename matches the nickname pattern) AND we can find a
+         ``/sessions/<nick>/mnt/<folder>`` reference in the file, use
+         ``<folder>``. The nickname is returned as ``session``.
+      2. Otherwise, the basename of ``cwd`` recorded inside the .jsonl.
+      3. Otherwise, the decoded on-disk folder name (lossy).
+      4. Otherwise, the raw folder name.
+
+    Files sitting directly in HISTORY_PATH get display "(root)".
     """
     parent = filepath.parent
     parent_key = str(parent)
-    cached = _PROJECT_NAME_CACHE.get(parent_key)
+    cached = _PROJECT_INFO_CACHE.get(parent_key)
     if cached is not None:
         return cached
 
-    # Files directly at the root
+    # Files at the root of the history folder
     try:
         rel = parent.relative_to(HISTORY_PATH)
         if str(rel) in ("", "."):
-            _PROJECT_NAME_CACHE[parent_key] = "(root)"
-            return "(root)"
+            info = {"display": "(root)", "session": None}
+            _PROJECT_INFO_CACHE[parent_key] = info
+            return info
     except Exception:
         pass
 
@@ -354,17 +422,38 @@ def project_display_name(filepath: Path) -> str:
     except Exception:
         cwd = None
 
+    session: str | None = None
     if cwd:
-        # Use the last path segment — that's almost always what a user
-        # thinks of as "the project".
         name = os.path.basename(cwd.rstrip("/\\")) or cwd
+        # If cwd is a Cowork session root (e.g. /sessions/vigilant-keen-davinci),
+        # the basename is just the session nickname — that's not very useful
+        # as a "project" label. Dig into the JSONL to find the mounted folder
+        # the user actually worked in and prefer that name instead.
+        if _looks_like_cowork_session(name):
+            mount, sess = _scan_cowork_mount(parent)
+            if mount:
+                session = sess or name
+                name = mount
+            else:
+                session = name  # keep the nickname so the UI can show it
     else:
-        # 2. Fall back to decoding the folder name.
+        # 2. Fall back to decoding the folder name on disk.
         decoded = _decode_claude_folder_name(parent.name)
         name = os.path.basename(decoded.rstrip("/\\")) or parent.name
+        if _looks_like_cowork_session(name):
+            mount, sess = _scan_cowork_mount(parent)
+            if mount:
+                session = sess or name
+                name = mount
 
-    _PROJECT_NAME_CACHE[parent_key] = name
-    return name
+    info = {"display": name, "session": session}
+    _PROJECT_INFO_CACHE[parent_key] = info
+    return info
+
+
+def project_display_name(filepath: Path) -> str:
+    """Thin wrapper — returns just the display label."""
+    return project_info(filepath)["display"]
 
 
 def project_key(filepath: Path) -> str:
@@ -419,10 +508,15 @@ def conversation_summary(filepath: Path) -> dict | None:
     cc_version = _first_nonempty(messages, "version")
     user_type = _first_nonempty(messages, "userType")
 
+    pinfo = project_info(filepath)
     return {
         "id": filepath.stem,
         "file": str(filepath),
-        "project": project_key(filepath),
+        "project": pinfo["display"],
+        # Cowork session nickname when the conversation ran inside a Cowork
+        # session — used as a secondary label / tooltip in the UI so the
+        # user can tell which session a conversation came from.
+        "project_session": pinfo.get("session"),
         "title": title,
         "preview": preview,
         "turn_count": len(turns),
@@ -660,6 +754,8 @@ def conversation_to_markdown(filepath: Path) -> str:
     lines.append("")
     lines.append(f"- **Conversation ID:** `{summary['id']}`")
     lines.append(f"- **Project:** `{summary['project']}`")
+    if summary.get("project_session"):
+        lines.append(f"- **Cowork session:** `{summary['project_session']}`")
     if summary.get("cwd"):
         lines.append(f"- **Working directory (cwd):** `{summary['cwd']}`")
     if summary.get("git_branch"):
@@ -1087,7 +1183,11 @@ HTML_TEMPLATE = r"""
   /* ── Conversation table ── */
   #conv-count { padding: 6px 14px; font-size: 11px; color: var(--text3); border-bottom: 1px solid var(--border); flex-shrink: 0; display: flex; justify-content: space-between; align-items: center; }
   #conv-list { flex: 1; overflow-y: auto; }
-  .col-header, .conv-item { display: grid; grid-template-columns: 28px 1fr 110px 150px; align-items: stretch; }
+  /* Column layout: the CONVERSATION column is the most important, so give
+     it a hard floor (minmax) and let it grow. Date and Project columns
+     have their own floors so they stay readable but can shrink a little
+     when the sidebar is narrow. */
+  .col-header, .conv-item { display: grid; grid-template-columns: 28px minmax(280px, 2.6fr) minmax(88px, 1fr) minmax(110px, 1.1fr); align-items: stretch; }
   .col-header { background: var(--surface2); border-bottom: 1px solid var(--border); position: sticky; top: 0; z-index: 2; font-size: 10px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text3); }
   .col-header > div { padding: 8px 10px; border-right: 1px solid var(--border); }
   .col-header > div:last-child { border-right: 0; }
@@ -1106,6 +1206,10 @@ HTML_TEMPLATE = r"""
   .cell-date .date { color: var(--text); font-weight: 500; }
   .cell-date .time { color: var(--text3); margin-top: 2px; }
   .cell-project { color: var(--text); word-break: break-word; }
+  /* Smaller, dimmer line shown under the project name when the conversation
+     ran inside a Cowork session — so the nickname is still visible without
+     dominating the column. */
+  .cell-project .proj-session { font-size: 10px; color: var(--text3); margin-top: 2px; font-style: italic; }
   .filter-btn { background: transparent; border: 1px solid transparent; color: inherit; font: inherit; cursor: pointer; padding: 2px 4px; border-radius: 4px; text-align: left; width: 100%; }
   .filter-btn:hover { background: var(--bg); border-color: var(--accent); color: var(--accent); }
 
@@ -1435,7 +1539,13 @@ function renderList(convs) {
         </button>
       </div>
       <div class="cell cell-project">
-        <button class="filter-btn" data-project="${esc(c.project)}" title="Filter to this project">${esc(c.project)}</button>
+        <button class="filter-btn" data-project="${esc(c.project)}"
+          title="${esc(c.project_session ? 'Filter to this project — Cowork session: ' + c.project_session : 'Filter to this project')}">
+          <div>${esc(c.project)}</div>
+          ${c.project_session && c.project_session !== c.project
+              ? `<div class="proj-session">↳ ${esc(c.project_session)}</div>`
+              : ''}
+        </button>
       </div>`;
 
     // Checkbox handler
@@ -1505,7 +1615,10 @@ async function openConversation(c) {
   header.style.display = 'block';
   document.getElementById('ch-title').textContent = c.title;
   const date = c.last_ts ? new Date(c.last_ts).toLocaleString() : '';
-  document.getElementById('ch-meta').textContent = `${c.project}  ·  ${c.user_count} messages  ·  ${date}  ·  ${c.model || ''}`;
+  const projLabel = c.project_session && c.project_session !== c.project
+    ? `${c.project} (${c.project_session})`
+    : c.project;
+  document.getElementById('ch-meta').textContent = `${projLabel}  ·  ${c.user_count} messages  ·  ${date}  ·  ${c.model || ''}`;
 
   // Hide search results / welcome
   document.getElementById('welcome').style.display = 'none';
