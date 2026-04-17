@@ -56,7 +56,7 @@ def normalize_path_input(raw: str) -> str | None:
     """Clean a path string the user typed or pasted.
 
     Handles quotes, leading/trailing whitespace, ~ expansion, and shell-style
-    escaped spaces (e.g. /Users/joao/My\\ Folder). Returns None if empty.
+    escaped spaces (e.g. /Users/name/My\\ Folder). Returns None if empty.
     """
     if not raw:
         return None
