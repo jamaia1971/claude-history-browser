@@ -252,22 +252,102 @@ def parse_ts(ts_str):
         return None
 
 
-def project_key(filepath: Path) -> str:
-    """Return the project identifier for a .jsonl file.
+# Cache of per-folder "pretty" project names keyed by the parent directory,
+# so we don't re-scan a jsonl file every time we need a display name.
+_PROJECT_NAME_CACHE: dict[str, str] = {}
 
-    This is the path of the file's parent directory relative to HISTORY_PATH,
-    so nested subfolders produce distinct project names (e.g. "foo/bar").
-    Files directly in HISTORY_PATH get the project name "(root)".
-    """
+
+def _extract_cwd_from_jsonl(filepath: Path) -> str | None:
+    """Peek at the first few JSON lines of a .jsonl file and return the
+    `cwd` field if we find one. Claude Code / Cowork transcripts include
+    this on most records, so it's a reliable way to recover the actual
+    project path (the folder name on disk is a lossy dash-encoded form)."""
     try:
-        rel = filepath.parent.relative_to(HISTORY_PATH)
+        with open(filepath, encoding="utf-8", errors="replace") as f:
+            for i, line in enumerate(f):
+                if i >= 20:
+                    break
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                cwd = rec.get("cwd")
+                if isinstance(cwd, str) and cwd.strip():
+                    return cwd.strip()
     except Exception:
-        return filepath.parent.name
-    s = str(rel)
-    if s in ("", "."):
-        return "(root)"
-    # Normalize to forward slashes for display
-    return s.replace(os.sep, "/")
+        return None
+    return None
+
+
+def _decode_claude_folder_name(name: str) -> str:
+    """Best-effort decode of a Claude Code project folder name.
+
+    Claude Code encodes the cwd by replacing '/' with '-', so a folder
+    like '-Users-joao-code-my-proj' originally came from '/Users/joao/code/my-proj'.
+    This is lossy when the original path contains hyphens, so we only use
+    this as a fallback when the .jsonl files don't carry a `cwd` field.
+    """
+    if not name:
+        return name
+    if name.startswith("-"):
+        return "/" + name[1:].replace("-", "/")
+    return name.replace("-", "/")
+
+
+def project_display_name(filepath: Path) -> str:
+    """Return a human-friendly project name for a .jsonl file.
+
+    Order of preference:
+      1. The basename of the `cwd` field recorded inside the .jsonl file
+         (this is the actual project folder the user was working in).
+      2. The decoded folder name on disk (best-effort, lossy).
+      3. The raw folder name.
+    Files directly in HISTORY_PATH get "(root)".
+    """
+    parent = filepath.parent
+    parent_key = str(parent)
+    cached = _PROJECT_NAME_CACHE.get(parent_key)
+    if cached is not None:
+        return cached
+
+    # Files directly at the root
+    try:
+        rel = parent.relative_to(HISTORY_PATH)
+        if str(rel) in ("", "."):
+            _PROJECT_NAME_CACHE[parent_key] = "(root)"
+            return "(root)"
+    except Exception:
+        pass
+
+    # 1. Try to pull cwd from any .jsonl in this parent folder.
+    cwd = None
+    try:
+        for sibling in parent.glob("*.jsonl"):
+            cwd = _extract_cwd_from_jsonl(sibling)
+            if cwd:
+                break
+    except Exception:
+        cwd = None
+
+    if cwd:
+        # Use the last path segment — that's almost always what a user
+        # thinks of as "the project".
+        name = os.path.basename(cwd.rstrip("/\\")) or cwd
+    else:
+        # 2. Fall back to decoding the folder name.
+        decoded = _decode_claude_folder_name(parent.name)
+        name = os.path.basename(decoded.rstrip("/\\")) or parent.name
+
+    _PROJECT_NAME_CACHE[parent_key] = name
+    return name
+
+
+def project_key(filepath: Path) -> str:
+    """Backwards-compatible alias used in several places."""
+    return project_display_name(filepath)
 
 
 def conversation_summary(filepath: Path) -> dict | None:
@@ -640,9 +720,12 @@ HTML_TEMPLATE = r"""
     --result-bg: #121824;
     --radius: 10px;
     --sidebar-w: 620px;
+    --splitter-w: 6px;
   }
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 14px; height: 100vh; display: flex; flex-direction: column; }
+  body.resizing { cursor: col-resize; user-select: none; }
+  body.resizing * { user-select: none !important; }
 
   /* ── Header ── */
   header { display: flex; align-items: center; gap: 12px; padding: 10px 16px; background: var(--surface); border-bottom: 1px solid var(--border); flex-shrink: 0; }
@@ -657,13 +740,39 @@ HTML_TEMPLATE = r"""
   .body { display: flex; flex: 1; overflow: hidden; }
 
   /* ── Sidebar ── */
-  aside { width: var(--sidebar-w); min-width: 420px; background: var(--surface); border-right: 1px solid var(--border); display: flex; flex-direction: column; overflow: hidden; }
+  aside { width: var(--sidebar-w); min-width: 320px; max-width: calc(100vw - 360px); background: var(--surface); border-right: 1px solid var(--border); display: flex; flex-direction: column; overflow: hidden; flex-shrink: 0; }
   .sidebar-top { padding: 10px 12px; border-bottom: 1px solid var(--border); flex-shrink: 0; display: flex; flex-direction: column; gap: 8px; }
   .row { display: flex; align-items: center; gap: 8px; }
-  #project-select { flex: 1; background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 5px 8px; color: var(--text); font-size: 13px; cursor: pointer; }
-  #download-btn { background: var(--accent); color: #0f1117; border: none; border-radius: 6px; padding: 6px 12px; cursor: pointer; font-size: 12px; font-weight: 600; white-space: nowrap; }
-  #download-btn:disabled { background: var(--surface2); color: var(--text3); cursor: not-allowed; }
+  #project-select { flex: 1; min-width: 0; background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 5px 8px; color: var(--text); font-size: 13px; cursor: pointer; }
+  #download-btn { display: block; width: 100%; background: var(--accent); color: #0f1117; border: 2px solid var(--accent); border-radius: 6px; padding: 8px 12px; cursor: pointer; font-size: 13px; font-weight: 700; white-space: nowrap; text-align: center; transition: filter 0.15s, background 0.15s, color 0.15s; }
+  #download-btn:disabled { background: transparent; color: var(--accent); cursor: not-allowed; opacity: 0.7; }
   #download-btn:not(:disabled):hover { filter: brightness(1.1); }
+
+  /* ── Splitter / resizer between sidebar and main ── */
+  .splitter {
+    width: var(--splitter-w);
+    flex-shrink: 0;
+    background: var(--border);
+    cursor: col-resize;
+    position: relative;
+    transition: background 0.15s;
+  }
+  .splitter:hover,
+  .splitter.dragging { background: var(--accent); }
+  .splitter::after {
+    content: "";
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    width: 2px;
+    height: 40px;
+    background: var(--text3);
+    border-radius: 2px;
+    opacity: 0.6;
+  }
+  .splitter:hover::after,
+  .splitter.dragging::after { background: #fff; opacity: 0.9; }
 
   /* ── Active filter pills ── */
   .pills { display: flex; flex-wrap: wrap; gap: 6px; min-height: 0; }
@@ -755,19 +864,23 @@ HTML_TEMPLATE = r"""
     <div class="sidebar-top">
       <div class="row">
         <select id="project-select"><option value="">All projects</option></select>
-        <button id="download-btn" disabled>⬇︎ Download (0)</button>
       </div>
+      <button id="download-btn" disabled>⬇︎ Download selected as Markdown (0)</button>
       <div id="filter-pills" class="pills"></div>
     </div>
     <div id="conv-count">Loading…</div>
     <div class="col-header">
-      <div title="Select">☐</div>
+      <div title="Select all visible" style="display:flex;align-items:center;justify-content:center;padding:0;">
+        <input id="select-all" type="checkbox" style="width:16px;height:16px;cursor:pointer;accent-color:var(--accent);" />
+      </div>
       <div>Conversation</div>
       <div>Date &amp; Hour</div>
       <div>Project</div>
     </div>
     <div id="conv-list"></div>
   </aside>
+
+  <div id="splitter" class="splitter" title="Drag to resize"></div>
 
   <main>
     <div id="welcome">
@@ -791,10 +904,89 @@ let currentProject = '';
 let dayFilter = '';          // yyyy-mm-dd (client side)
 let selected = new Set();    // conv ids selected for download
 
+// ── Splitter / resizer ───────────────────────────────────────────────────────
+function setSidebarWidth(px) {
+  const min = 320;
+  const max = Math.max(min + 40, window.innerWidth - 360);
+  const clamped = Math.min(Math.max(px, min), max);
+  document.documentElement.style.setProperty('--sidebar-w', clamped + 'px');
+  try { localStorage.setItem('chb-sidebar-w', String(clamped)); } catch (e) {}
+}
+
+function initSplitter() {
+  // Restore saved width
+  try {
+    const saved = parseInt(localStorage.getItem('chb-sidebar-w') || '', 10);
+    if (!Number.isNaN(saved) && saved > 0) setSidebarWidth(saved);
+  } catch (e) {}
+
+  const splitter = document.getElementById('splitter');
+  if (!splitter) return;
+
+  let dragging = false;
+  const onMove = (e) => {
+    if (!dragging) return;
+    const x = (e.touches ? e.touches[0].clientX : e.clientX);
+    setSidebarWidth(x);
+    if (e.cancelable) e.preventDefault();
+  };
+  const stop = () => {
+    if (!dragging) return;
+    dragging = false;
+    splitter.classList.remove('dragging');
+    document.body.classList.remove('resizing');
+  };
+  const start = (e) => {
+    dragging = true;
+    splitter.classList.add('dragging');
+    document.body.classList.add('resizing');
+    if (e.cancelable) e.preventDefault();
+  };
+
+  splitter.addEventListener('mousedown', start);
+  splitter.addEventListener('touchstart', start, {passive: false});
+  document.addEventListener('mousemove', onMove);
+  document.addEventListener('touchmove', onMove, {passive: false});
+  document.addEventListener('mouseup', stop);
+  document.addEventListener('touchend', stop);
+
+  // Double-click resets to default width
+  splitter.addEventListener('dblclick', () => setSidebarWidth(620));
+}
+
 // ── Init ─────────────────────────────────────────────────────────────────────
 async function init() {
+  initSplitter();
+  initSelectAll();
   await loadProjects();
   await loadConversations();
+}
+
+function initSelectAll() {
+  const el = document.getElementById('select-all');
+  if (!el) return;
+  el.addEventListener('change', () => {
+    if (el.checked) {
+      displayedConversations.forEach(c => selected.add(c.id));
+    } else {
+      displayedConversations.forEach(c => selected.delete(c.id));
+    }
+    renderList(displayedConversations);
+  });
+}
+
+function syncSelectAllCheckbox() {
+  const el = document.getElementById('select-all');
+  if (!el) return;
+  if (!displayedConversations.length) {
+    el.checked = false;
+    el.indeterminate = false;
+    return;
+  }
+  const total = displayedConversations.length;
+  const sel = displayedConversations.filter(c => selected.has(c.id)).length;
+  el.checked = sel === total;
+  el.indeterminate = sel > 0 && sel < total;
 }
 
 async function loadProjects() {
@@ -940,8 +1132,9 @@ function renderList(convs) {
 
 function updateDownloadBtn() {
   const btn = document.getElementById('download-btn');
-  btn.textContent = `⬇︎ Download (${selected.size})`;
+  btn.textContent = `⬇︎ Download selected as Markdown (${selected.size})`;
   btn.disabled = selected.size === 0;
+  syncSelectAllCheckbox();
 }
 
 // ── Open conversation ────────────────────────────────────────────────────────
