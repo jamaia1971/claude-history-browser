@@ -1374,24 +1374,47 @@ document.getElementById('download-btn').addEventListener('click', async () => {
 });
 
 // ── Copy selected as Markdown (to clipboard) ─────────────────────────────────
-async function copyTextToClipboard(text) {
-  // Preferred: async clipboard API (needs http://localhost which is a secure context).
-  if (navigator.clipboard && window.isSecureContext) {
-    try {
-      await navigator.clipboard.writeText(text);
-      return true;
-    } catch (_) { /* fall through */ }
+//
+// Copying from a button is awkward in Safari: once we `await fetch()`, the
+// user-gesture required by `navigator.clipboard.writeText` is consumed and
+// both `writeText` and the legacy `execCommand('copy')` silently fail.
+//
+// The fix is the `ClipboardItem` + Promise pattern: `clipboard.write([item])`
+// is invoked synchronously inside the click handler, while the Blob it
+// contains resolves asynchronously. Safari/WebKit explicitly supports this.
+// Chrome / Firefox / Edge also support it.
+//
+// If that still fails (very old browser, permission denied, etc.), we fall
+// through to legacy methods and finally to a modal with a pre-selected
+// textarea so the user can always Cmd/Ctrl+C manually.
+
+async function fetchExportMarkdown(ids) {
+  const res = await fetch('/api/copy', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({ids}),
+  });
+  if (!res.ok) {
+    let msg = 'Copy failed';
+    try { msg = (await res.json()).error || msg; } catch (_) {}
+    throw new Error(msg);
   }
-  // Fallback: hidden textarea + execCommand.
+  const data = await res.json();
+  return data.markdown || '';
+}
+
+function legacyCopyFallback(text) {
   try {
     const ta = document.createElement('textarea');
     ta.value = text;
+    ta.setAttribute('readonly', '');
     ta.style.position = 'fixed';
     ta.style.top = '-1000px';
     ta.style.opacity = '0';
     document.body.appendChild(ta);
     ta.focus();
     ta.select();
+    ta.setSelectionRange(0, text.length);
     const ok = document.execCommand('copy');
     ta.remove();
     return ok;
@@ -1400,42 +1423,165 @@ async function copyTextToClipboard(text) {
   }
 }
 
-document.getElementById('copy-btn').addEventListener('click', async () => {
+// Modal fallback: if both clipboard APIs refuse, show the text with the
+// textarea already focused and selected so the user can just hit Cmd/Ctrl+C.
+function ensureManualCopyModal() {
+  let bd = document.getElementById('manual-copy-backdrop');
+  if (bd) return bd;
+  bd = document.createElement('div');
+  bd.id = 'manual-copy-backdrop';
+  bd.setAttribute('role', 'dialog');
+  bd.setAttribute('aria-modal', 'true');
+  bd.style.cssText =
+    'position:fixed;inset:0;background:rgba(0,0,0,0.55);display:none;' +
+    'align-items:center;justify-content:center;z-index:110;';
+  bd.innerHTML = `
+    <div style="background:var(--surface);border:1px solid var(--border);
+                border-radius:12px;max-width:720px;width:calc(100% - 32px);
+                max-height:80vh;padding:20px 22px;color:var(--text);
+                display:flex;flex-direction:column;gap:10px;
+                box-shadow:0 12px 48px rgba(0,0,0,0.5);">
+      <div style="font-size:15px;font-weight:600;color:var(--accent);">
+        Copy Markdown manually
+      </div>
+      <div style="font-size:12px;color:var(--text2);line-height:1.5;">
+        Your browser blocked the clipboard API for this action. The text is
+        selected below — press <kbd>⌘C</kbd> (Mac) or <kbd>Ctrl+C</kbd>
+        (Windows/Linux) to copy, then close this window.
+      </div>
+      <textarea id="manual-copy-textarea" readonly
+        style="flex:1;min-height:260px;background:var(--bg);
+               color:var(--text);border:1px solid var(--border);
+               border-radius:6px;padding:10px 12px;font-family:ui-monospace,
+               SFMono-Regular,Menlo,monospace;font-size:12px;resize:vertical;
+               white-space:pre;"></textarea>
+      <div style="display:flex;gap:8px;justify-content:flex-end;">
+        <button id="manual-copy-try" type="button"
+          style="background:var(--accent2);color:#0f1117;border:0;
+                 border-radius:6px;padding:6px 14px;cursor:pointer;
+                 font-weight:600;font-size:13px;">Try copy again</button>
+        <button id="manual-copy-close" type="button"
+          style="background:var(--accent);color:#0f1117;border:0;
+                 border-radius:6px;padding:6px 14px;cursor:pointer;
+                 font-weight:600;font-size:13px;">Close</button>
+      </div>
+    </div>`;
+  document.body.appendChild(bd);
+
+  const close = () => { bd.style.display = 'none'; };
+  bd.addEventListener('click', (e) => { if (e.target === bd) close(); });
+  bd.querySelector('#manual-copy-close').addEventListener('click', close);
+  bd.querySelector('#manual-copy-try').addEventListener('click', () => {
+    const ta = bd.querySelector('#manual-copy-textarea');
+    ta.focus();
+    ta.select();
+    try {
+      const ok = document.execCommand('copy');
+      if (ok) close();
+    } catch (_) { /* user can still Cmd/Ctrl+C */ }
+  });
+  return bd;
+}
+
+function showManualCopyModal(text) {
+  const bd = ensureManualCopyModal();
+  const ta = bd.querySelector('#manual-copy-textarea');
+  ta.value = text;
+  bd.style.display = 'flex';
+  // Wait a tick so the textarea is visible before selecting.
+  setTimeout(() => {
+    ta.focus();
+    ta.select();
+    try { ta.setSelectionRange(0, text.length); } catch (_) {}
+  }, 30);
+}
+
+document.getElementById('copy-btn').addEventListener('click', () => {
   if (!selected.size) return;
   const btn = document.getElementById('copy-btn');
   const n = selected.size;
+  const ids = [...selected];
+
   btn.textContent = 'Preparing…';
   btn.disabled = true;
 
-  try {
-    const res = await fetch('/api/copy', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ids: [...selected]}),
+  const flash = () => {
+    btn.classList.add('copied');
+    btn.textContent = `✓ Copied ${n}!`;
+    setTimeout(() => {
+      btn.classList.remove('copied');
+      updateDownloadBtn();
+    }, 1600);
+  };
+  const resetIdle = () => {
+    btn.classList.remove('copied');
+    btn.disabled = selected.size === 0;
+    updateDownloadBtn();
+  };
+
+  // ── Pattern 1: Safari-safe ClipboardItem + Promise ────────────────────────
+  // We MUST call navigator.clipboard.write synchronously inside the click
+  // handler. The Blob inside ClipboardItem can be a Promise.
+  if (
+    window.isSecureContext &&
+    navigator.clipboard &&
+    typeof navigator.clipboard.write === 'function' &&
+    typeof window.ClipboardItem === 'function'
+  ) {
+    let cachedMd = '';
+    const blobPromise = fetchExportMarkdown(ids).then((md) => {
+      cachedMd = md;
+      return new Blob([md], {type: 'text/plain'});
     });
-    if (!res.ok) {
-      const err = await res.json().catch(() => ({error: 'Copy failed'}));
-      alert(err.error || 'Copy failed');
+
+    let item;
+    try {
+      item = new ClipboardItem({'text/plain': blobPromise});
+    } catch (_) {
+      item = null;
+    }
+
+    if (item) {
+      navigator.clipboard.write([item])
+        .then(flash)
+        .catch(async () => {
+          // Promise-based write was rejected. Try the fetched text via
+          // writeText / execCommand / manual-copy modal.
+          let md = cachedMd;
+          if (!md) {
+            try { md = await fetchExportMarkdown(ids); }
+            catch (e) { alert(e.message || 'Copy failed'); resetIdle(); return; }
+          }
+          if (navigator.clipboard && navigator.clipboard.writeText) {
+            try { await navigator.clipboard.writeText(md); flash(); return; }
+            catch (_) { /* continue */ }
+          }
+          if (legacyCopyFallback(md)) { flash(); return; }
+          showManualCopyModal(md);
+          resetIdle();
+        });
       return;
     }
-    const data = await res.json();
-    const md = data.markdown || '';
-    const ok = await copyTextToClipboard(md);
-    if (ok) {
-      btn.classList.add('copied');
-      btn.textContent = `✓ Copied ${n}!`;
-      setTimeout(() => {
-        btn.classList.remove('copied');
-        updateDownloadBtn();
-      }, 1600);
-    } else {
-      alert('Could not write to the clipboard. Try using the Download button instead.');
-    }
-  } finally {
-    btn.disabled = selected.size === 0;
-    // Keep transient label if still in "copied" state; otherwise refresh counts.
-    if (!btn.classList.contains('copied')) updateDownloadBtn();
   }
+
+  // ── Pattern 2: Legacy path (no ClipboardItem support) ─────────────────────
+  (async () => {
+    let md = '';
+    try {
+      md = await fetchExportMarkdown(ids);
+    } catch (e) {
+      alert(e.message || 'Copy failed');
+      resetIdle();
+      return;
+    }
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      try { await navigator.clipboard.writeText(md); flash(); return; }
+      catch (_) { /* fall through */ }
+    }
+    if (legacyCopyFallback(md)) { flash(); return; }
+    showManualCopyModal(md);
+    resetIdle();
+  })();
 });
 
 // ── About dialog ─────────────────────────────────────────────────────────────
