@@ -54,6 +54,8 @@ p.write_text(json.dumps(d, indent=2))"
 
 On Windows (PowerShell):
 
+> ⚠️ **Windows caveat:** I have no idea whether this actually works. I've been a Mac user for so long I cannot remember my last Windows version, so the PowerShell snippet below — and any other Windows-specific suggestion in this repo — was proposed by Claude and has never been tested by me on a real Windows machine. Use at your own risk, check the resulting `settings.json` by hand, and please open an issue (or PR) if something needs fixing.
+
 ```powershell
 $path = "$env:USERPROFILE\.claude\settings.json"
 if (-not (Test-Path $path)) { New-Item -ItemType File -Force -Path $path | Out-Null; Set-Content $path '{}' }

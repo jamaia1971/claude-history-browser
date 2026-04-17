@@ -104,6 +104,8 @@ Everything is local. The server binds to `127.0.0.1` only. Nothing ever leaves y
 
 ## Linux / Windows tip
 
+> ⚠️ **Full disclosure:** I have no idea whether any of the Windows instructions anywhere in this repo actually work. I've been a Mac user for so long I cannot remember my last Windows version, so anything Windows-specific here was proposed by Claude and has never been tested by me on a real Windows machine. If you run into trouble on Windows, please open an issue — or better yet, a PR with a version that actually works.
+
 The folder picker uses AppleScript (`osascript`) because I'm on macOS. On other platforms it will just fall back to asking you to paste a path, which works fine. If you want a native dialog anyway, swap `pick_folder_mac()` for a `tkinter` version:
 
 ```python
@@ -146,6 +148,8 @@ If you're going to touch the HTML template, it lives inside `claude_history_brow
 ## About the author
 
 I'm [@jamaia1971](https://github.com/jamaia1971). I'm a **vibe coder**. My "real" programming background is embarrassingly ancient and entirely self-taught: I wrote a lot of **BASIC** as a 12-year-old kid on an **Apple II Plus**, poked at a little **assembly** on the side, and later did some **Pascal** at university in the **PC/XT** era. I was the curious kid who opened up every computer I could get my hands on just to see what was inside, and I picked things up on my own by reading, tinkering, and breaking stuff until it worked again. Then adult life happened and I did approximately nothing programming-wise for a few decades.
+
+I'm a Mac guy for so long I cannot remember my last Windows version — so if anything in this repo mentions Windows, treat it as a good-faith guess rather than tested instructions.
 
 Since LLMs came around I've been learning some **Python** on my own — and I'm brand new to **GitHub**, so I'm still fumbling through it and no doubt doing some foul things with branches, commits, and `.gitignore`s along the way. Bear with me.
 
