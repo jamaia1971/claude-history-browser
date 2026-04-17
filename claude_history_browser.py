@@ -431,6 +431,33 @@ def index():
     return render_template_string(HTML_TEMPLATE)
 
 
+# Inline SVG favicon — purple rounded square with a magnifying glass (lupa),
+# evoking the "browse / search conversations" purpose of the app.
+# Served from /favicon.svg (modern browsers) and /favicon.ico (legacy fallback,
+# which Safari and most browsers will happily render from SVG bytes).
+FAVICON_SVG = (
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">'
+    '<rect width="32" height="32" rx="7" fill="#c67eff"/>'
+    '<circle cx="13.5" cy="13.5" r="5.8" fill="none" stroke="#0f1117" '
+    'stroke-width="2.8"/>'
+    '<line x1="17.8" y1="17.8" x2="24" y2="24" stroke="#0f1117" '
+    'stroke-width="3.2" stroke-linecap="round"/>'
+    '</svg>'
+)
+
+
+@app.route("/favicon.svg")
+def favicon_svg():
+    return Response(FAVICON_SVG, mimetype="image/svg+xml")
+
+
+@app.route("/favicon.ico")
+def favicon_ico():
+    # Safari / older browsers still request /favicon.ico by default.
+    # Return the SVG bytes with an SVG mimetype — browsers accept it.
+    return Response(FAVICON_SVG, mimetype="image/svg+xml")
+
+
 @app.route("/api/projects")
 def api_projects():
     """Return list of projects — every directory (at any depth) that
@@ -781,6 +808,10 @@ HTML_TEMPLATE = r"""
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Claude History Browser</title>
 <meta name="application-name" content="Claude History Browser">
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<link rel="alternate icon" href="/favicon.ico">
+<link rel="mask-icon" href="/favicon.svg" color="#c67eff">
+<link rel="apple-touch-icon" href="/favicon.svg">
 <style>
   :root {
     --bg: #0f1117;
