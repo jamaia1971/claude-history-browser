@@ -1272,9 +1272,13 @@ HTML_TEMPLATE = r"""
   #welcome { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px; color: var(--text3); padding: 20px; text-align: center; }
   #welcome h2 { color: var(--text2); }
   #conv-view { flex: 1; overflow-y: auto; padding: 20px 24px; display: none; }
-  #conv-header { padding: 12px 24px; background: var(--surface); border-bottom: 1px solid var(--border); flex-shrink: 0; display: none; }
-  #conv-header h2 { font-size: 15px; font-weight: 600; color: var(--text); }
-  #conv-header .meta { font-size: 12px; color: var(--text3); margin-top: 3px; }
+  #conv-header { padding: 12px 24px; background: var(--surface); border-bottom: 1px solid var(--border); flex-shrink: 0; display: none; position: relative; }
+  #conv-header h2 { font-size: 15px; font-weight: 600; color: var(--text); padding-right: 150px; /* room for the compact toggle */ }
+  #conv-header .meta { font-size: 12px; color: var(--text3); margin-top: 3px; padding-right: 150px; }
+  /* Compact-blocks toggle lives in the conversation header's top-right corner. */
+  #compact-toggle { position: absolute; top: 10px; right: 14px; background: transparent; color: var(--text3); border: 1px solid var(--border); border-radius: 6px; padding: 4px 10px; font-size: 11px; cursor: pointer; transition: all 0.15s ease; }
+  #compact-toggle:hover { border-color: var(--accent); color: var(--accent); }
+  #compact-toggle.on { background: var(--accent); color: var(--bg); border-color: var(--accent); }
   /* Token tally in the conversation header. Slight accent colour + help
      cursor hints that hovering reveals a cache-usage breakdown tooltip. */
   #conv-header .meta .meta-tokens {
@@ -1301,14 +1305,15 @@ HTML_TEMPLATE = r"""
   .block-thinking .think-body { white-space: pre-wrap; margin-top: 6px; }
   .block-tool { background: var(--tool-bg); border: 1px solid #1e3020; border-radius: 6px; padding: 8px 12px; }
   .block-tool .tool-name { font-size: 11px; font-weight: 700; color: #6dcc88; text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 4px; }
-  /* No max-height / overflow cap here: earlier versions clipped tool inputs
-     at 200px with overflow:hidden, which silently cut off the end of long
-     Edit/Write payloads (invisibly — there was no scrollbar). Show the full
-     content inline; the reader pane itself scrolls. */
+  /* Default (full) view: no max-height, no overflow cap — tool/result blocks
+     render in full. Compact view (toggle in header) caps them at 240px with
+     a scrollbar so you can scan a long conversation without endless scrolling. */
   .block-tool pre { font-size: 11px; color: #8ecf9e; white-space: pre-wrap; word-break: break-all; }
   .block-result { background: var(--result-bg); border: 1px solid #1a2535; border-radius: 6px; padding: 8px 12px; }
   .block-result .result-label { font-size: 11px; font-weight: 600; color: var(--text3); margin-bottom: 4px; }
   .block-result pre { font-size: 11px; color: var(--text2); white-space: pre-wrap; word-break: break-all; }
+  #conv-view.compact-blocks .block-tool pre,
+  #conv-view.compact-blocks .block-result pre { max-height: 240px; overflow: auto; }
 
   /* ── Search results ── */
   #search-results { flex: 1; overflow-y: auto; padding: 16px 24px; display: none; }
@@ -1406,6 +1411,7 @@ HTML_TEMPLATE = r"""
     <div id="conv-header">
       <h2 id="ch-title"></h2>
       <div class="meta" id="ch-meta"></div>
+      <button id="compact-toggle" type="button" title="Clip long tool inputs and tool results at ~240px with an inner scrollbar, so you can scan a long conversation faster. Toggle off to see each block in full.">🗜 Compact tool blocks</button>
     </div>
     <div id="conv-view"></div>
     <div id="search-results"></div>
@@ -1419,6 +1425,31 @@ let currentProject = '';
 let dayFilter = '';          // yyyy-mm-dd (client side)
 let selected = new Set();    // conv ids selected for download
 let currentTurnIndex = -1;   // index of the focused .turn in the reading pane (-1 = none)
+
+// ── Compact-blocks toggle ────────────────────────────────────────────────────
+// Caps .block-tool pre and .block-result pre at 240px with an inner scrollbar.
+// Default is OFF (full content visible). Preference persists via localStorage.
+function applyCompactBlocks(on) {
+  const view = document.getElementById('conv-view');
+  const btn  = document.getElementById('compact-toggle');
+  if (view) view.classList.toggle('compact-blocks', !!on);
+  if (btn) {
+    btn.classList.toggle('on', !!on);
+    btn.textContent = on ? '🗜 Compact: on' : '🗜 Compact tool blocks';
+  }
+  try { localStorage.setItem('chb-compact-blocks', on ? '1' : '0'); } catch (e) {}
+}
+function initCompactToggle() {
+  let saved = '0';
+  try { saved = localStorage.getItem('chb-compact-blocks') || '0'; } catch (e) {}
+  applyCompactBlocks(saved === '1');
+  const btn = document.getElementById('compact-toggle');
+  if (btn) btn.addEventListener('click', () => {
+    const view = document.getElementById('conv-view');
+    const next = !(view && view.classList.contains('compact-blocks'));
+    applyCompactBlocks(next);
+  });
+}
 
 // ── Splitter / resizer ───────────────────────────────────────────────────────
 function setSidebarWidth(px) {
@@ -1474,6 +1505,7 @@ function initSplitter() {
 async function init() {
   initSplitter();
   initSelectAll();
+  initCompactToggle();
   await loadProjects();
   await loadConversations();
 }
