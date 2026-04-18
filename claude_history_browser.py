@@ -1272,11 +1272,20 @@ HTML_TEMPLATE = r"""
   #welcome { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px; color: var(--text3); padding: 20px; text-align: center; }
   #welcome h2 { color: var(--text2); }
   #conv-view { flex: 1; overflow-y: auto; padding: 20px 24px; display: none; }
-  #conv-header { padding: 12px 24px; background: var(--surface); border-bottom: 1px solid var(--border); flex-shrink: 0; display: none; position: relative; }
-  #conv-header h2 { font-size: 15px; font-weight: 600; color: var(--text); padding-right: 150px; /* room for the compact toggle */ }
-  #conv-header .meta { font-size: 12px; color: var(--text3); margin-top: 3px; padding-right: 150px; }
-  /* Compact-blocks toggle lives in the conversation header's top-right corner. */
-  #compact-toggle { position: absolute; top: 10px; right: 14px; background: transparent; color: var(--text3); border: 1px solid var(--border); border-radius: 6px; padding: 4px 10px; font-size: 11px; cursor: pointer; transition: all 0.15s ease; }
+  #conv-header { padding: 12px 24px; background: var(--surface); border-bottom: 1px solid var(--border); flex-shrink: 0; display: none; }
+  #conv-header h2 { font-size: 15px; font-weight: 600; color: var(--text); }
+  #conv-header .meta { font-size: 12px; color: var(--text3); margin-top: 3px; }
+  /* Conversation toolbar: filter chips + compact toggle. Sits below the
+     header, above the reader. Hidden until a conversation is open. */
+  #conv-toolbar { display: none; align-items: center; gap: 12px; padding: 8px 24px; background: var(--surface); border-bottom: 1px solid var(--border); flex-shrink: 0; flex-wrap: wrap; }
+  .filter-row { display: flex; align-items: center; gap: 6px; flex: 1; flex-wrap: wrap; min-width: 0; }
+  .filter-row .filter-label { font-size: 10px; color: var(--text3); text-transform: uppercase; letter-spacing: 0.06em; margin-right: 4px; }
+  /* Per-category show/hide chip. Pressed (.on) = visible category. */
+  .filter-btn-ct { background: transparent; border: 1px solid var(--border); color: var(--text3); border-radius: 4px; padding: 3px 10px; font-size: 11px; font-family: inherit; cursor: pointer; transition: all 0.15s ease; white-space: nowrap; }
+  .filter-btn-ct:hover { color: var(--text); border-color: var(--accent); }
+  .filter-btn-ct.on { background: var(--accent); color: var(--bg); border-color: var(--accent); font-weight: 600; }
+  /* Compact-blocks toggle lives in the toolbar, pushed to the right. */
+  #compact-toggle { background: transparent; color: var(--text3); border: 1px solid var(--border); border-radius: 4px; padding: 3px 10px; font-size: 11px; font-family: inherit; cursor: pointer; transition: all 0.15s ease; white-space: nowrap; margin-left: auto; }
   #compact-toggle:hover { border-color: var(--accent); color: var(--accent); }
   #compact-toggle.on { background: var(--accent); color: var(--bg); border-color: var(--accent); }
   /* Token tally in the conversation header. Slight accent colour + help
@@ -1430,6 +1439,18 @@ HTML_TEMPLATE = r"""
     <div id="conv-header">
       <h2 id="ch-title"></h2>
       <div class="meta" id="ch-meta"></div>
+    </div>
+    <!-- Toolbar: category filters + compact-blocks toggle. Lives between the
+         header and the reader. All chips are ON by default (everything shown). -->
+    <div id="conv-toolbar">
+      <div class="filter-row">
+        <span class="filter-label">Show:</span>
+        <button class="filter-btn-ct on" data-filter="you"      type="button" title="Show/hide turns that contain text you actually typed.">👤 You</button>
+        <button class="filter-btn-ct on" data-filter="claude"   type="button" title="Show/hide Claude's replies (assistant turns).">✦ Claude</button>
+        <button class="filter-btn-ct on" data-filter="tool"     type="button" title="Show/hide tool-call blocks (🔧 ToolName — what Claude asked a tool to do).">🔧 Tool</button>
+        <button class="filter-btn-ct on" data-filter="thinking" type="button" title="Show/hide Claude's internal reasoning blocks (🧠 Thinking).">🧠 Thinking</button>
+        <button class="filter-btn-ct on" data-filter="result"   type="button" title="Show/hide tool output / system-injected turns (📤 Tool result, ⚙️ System).">📤 Result</button>
+      </div>
       <button id="compact-toggle" type="button" title="Clip long tool inputs and tool results at ~240px with an inner scrollbar, so you can scan a long conversation faster. Toggle off to see each block in full.">🗜 Compact tool blocks</button>
     </div>
     <div id="conv-view"></div>
@@ -1467,6 +1488,96 @@ function initCompactToggle() {
     const view = document.getElementById('conv-view');
     const next = !(view && view.classList.contains('compact-blocks'));
     applyCompactBlocks(next);
+  });
+}
+
+// ── Turn / block filters ─────────────────────────────────────────────────────
+// Five independent chips that show/hide categories in the reading pane:
+//   you      — user turns (text you typed)
+//   claude   — assistant turns (Claude's replies)
+//   tool     — tool_use blocks (🔧) — lives inside assistant turns
+//   thinking — thinking blocks (🧠) — lives inside assistant turns
+//   result   — tool_result blocks AND "📤 Tool result" / "⚙️ System" user-role turns
+//
+// A chip ON = category visible. A chip OFF = category hidden.
+// State persists in localStorage under `chb-turn-filters` as a comma list of
+// enabled categories (so "add a new filter later" keeps older prefs usable).
+let FILTERS = {you: true, claude: true, tool: true, thinking: true, result: true};
+
+function applyFilters() {
+  const view = document.getElementById('conv-view');
+  if (!view) return;
+  const turns = view.querySelectorAll('.turn');
+  turns.forEach(turnEl => {
+    // Turn-level visibility first. Our classifier writes the kind onto
+    // `turn.<kind>`: user | assistant | tool-result | system.
+    let turnHidden = false;
+    if (turnEl.classList.contains('user') && !FILTERS.you) turnHidden = true;
+    if (turnEl.classList.contains('assistant') && !FILTERS.claude) turnHidden = true;
+    if ((turnEl.classList.contains('tool-result') || turnEl.classList.contains('system'))
+        && !FILTERS.result) turnHidden = true;
+
+    // Block-level visibility inside assistant turns (tool_use, thinking) and
+    // inside any turn for tool_result leftovers. We toggle each block's own
+    // display, then — if every block ends up hidden — hide the whole turn so
+    // we don't leave an empty bubble behind.
+    const blocks = turnEl.querySelectorAll('.block');
+    let anyVisible = false;
+    blocks.forEach(b => {
+      let hide = false;
+      if (b.classList.contains('block-tool')     && !FILTERS.tool)     hide = true;
+      if (b.classList.contains('block-thinking') && !FILTERS.thinking) hide = true;
+      if (b.classList.contains('block-result')   && !FILTERS.result)   hide = true;
+      b.style.display = hide ? 'none' : '';
+      if (!hide) anyVisible = true;
+    });
+
+    // If the turn has no blocks at all (rare), treat the label alone as
+    // content and let turn-level rules decide.
+    const hasBlocks = blocks.length > 0;
+    const hideByEmpty = hasBlocks && !anyVisible;
+    turnEl.style.display = (turnHidden || hideByEmpty) ? 'none' : '';
+  });
+
+  // Clamp the active-turn cursor to a visible turn so arrow-nav stays usable.
+  const visibleTurns = Array.from(turns).filter(t => t.style.display !== 'none');
+  if (!visibleTurns.length) {
+    currentTurnIndex = -1;
+  } else if (currentTurnIndex >= 0 && turns[currentTurnIndex] && turns[currentTurnIndex].style.display === 'none') {
+    // The previously active turn got hidden — jump to the first visible one.
+    const firstIdx = Array.from(turns).indexOf(visibleTurns[0]);
+    if (firstIdx >= 0) setActiveTurn(firstIdx, {scroll: false});
+  }
+}
+
+function saveFilters() {
+  try {
+    const on = Object.keys(FILTERS).filter(k => FILTERS[k]);
+    localStorage.setItem('chb-turn-filters', on.join(','));
+  } catch (e) {}
+}
+
+function initFilters() {
+  // Load persisted prefs (if any). Absence = all on (default).
+  try {
+    const raw = localStorage.getItem('chb-turn-filters');
+    if (raw !== null) {
+      const on = new Set(raw.split(',').filter(Boolean));
+      Object.keys(FILTERS).forEach(k => { FILTERS[k] = on.has(k); });
+    }
+  } catch (e) {}
+
+  // Reflect state onto the chips + wire click handlers.
+  document.querySelectorAll('.filter-btn-ct').forEach(btn => {
+    const key = btn.dataset.filter;
+    if (!key) return;
+    btn.classList.toggle('on', !!FILTERS[key]);
+    btn.addEventListener('click', () => {
+      FILTERS[key] = !FILTERS[key];
+      btn.classList.toggle('on', FILTERS[key]);
+      saveFilters();
+      applyFilters();
+    });
   });
 }
 
@@ -1525,6 +1636,7 @@ async function init() {
   initSplitter();
   initSelectAll();
   initCompactToggle();
+  initFilters();
   await loadProjects();
   await loadConversations();
 }
@@ -1728,9 +1840,11 @@ async function openConversation(c) {
   const el = document.querySelector(`.conv-item[data-id="${c.id}"]`);
   if (el) el.classList.add('active');
 
-  // Show header
+  // Show header + toolbar
   const header = document.getElementById('conv-header');
   header.style.display = 'block';
+  const toolbar = document.getElementById('conv-toolbar');
+  if (toolbar) toolbar.style.display = 'flex';
   document.getElementById('ch-title').textContent = c.title;
   const date = c.last_ts ? new Date(c.last_ts).toLocaleString() : '';
   const projLabel = c.project_session && c.project_session !== c.project
@@ -1984,9 +2098,16 @@ function renderConversation(turns, container) {
   });
   container.scrollTop = 0;
 
-  // Reset the active-turn cursor to the first turn (if any). No scroll here —
-  // the reader is already at the top; the keyboard handler will scroll on move.
-  currentTurnIndex = turns.length ? 0 : -1;
+  // Apply active filters so newly rendered turns/blocks respect any chips the
+  // user has toggled off. Call before setActiveTurn so we skip hidden turns.
+  applyFilters();
+
+  // Reset the active-turn cursor to the first VISIBLE turn (if any). No scroll
+  // here — the reader is already at the top; the keyboard handler will scroll
+  // on move.
+  const firstVisible = Array.from(container.querySelectorAll('.turn'))
+    .findIndex(t => t.style.display !== 'none');
+  currentTurnIndex = firstVisible >= 0 ? firstVisible : -1;
   setActiveTurn(currentTurnIndex, {scroll: false});
 }
 
@@ -2399,6 +2520,8 @@ async function runSearch(q) {
   document.getElementById('welcome').style.display = 'none';
   document.getElementById('conv-view').style.display = 'none';
   document.getElementById('conv-header').style.display = 'none';
+  const tb = document.getElementById('conv-toolbar');
+  if (tb) tb.style.display = 'none';
   const sr = document.getElementById('search-results');
   sr.style.display = 'block';
   sr.innerHTML = '<p style="color:var(--text3)">Searching…</p>';
