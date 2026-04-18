@@ -167,7 +167,9 @@ If you're going to touch the HTML template, it lives inside `claude_history_brow
 
 ## About the author
 
-I'm [@jamaia1971](https://github.com/jamaia1971), a seasoned lawyer. I dropped engineering school after two years and ten math courses, but I've loved computers for 40+ years — BASIC on an Apple II Plus as a kid, a little assembly, some Pascal at university. The 2023 LLM boom pulled me back into coding after decades away, and this browser is one of the first things I've shipped since — vibe-coded with Claude at the wheel.
+IMPORTANT: I AM NO CS GUY AND HAVE NO REAL CS BACKGROUND. I MADE THAT FOR MY PERSONAL USE. HOPE YOU UNDERSTAND AND LIKE.
+
+I'm [@jamaia1971](https://github.com/jamaia1971), a seasoned lawyer. I dropped engineering school after two years and ten math courses, but I've loved computers for 40+ years — BASIC on an Apple II Plus as a kid, a little assembly, some Pascal at university. The 2023 LLM boom pulled me back into reading and running some coding after decades away, and this history browser is one of the first things I've shipped since — vibe-coded with Claude at the wheel.
 
 ---
 
