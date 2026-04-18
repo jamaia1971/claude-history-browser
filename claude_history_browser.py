@@ -342,20 +342,21 @@ def _looks_like_cowork_session(name: str) -> bool:
 
 
 def _scan_cowork_mount(parent: Path) -> tuple[str | None, str | None]:
-    """Scan a few early JSONL lines in ``parent`` for ``/sessions/X/mnt/Y``
-    style paths and return the most common ``(mount_folder, session_name)``.
+    """Scan early JSONL lines in ``parent`` for ``/sessions/X/mnt/Y`` style
+    paths and return the most common ``(mount_folder, session_name)``.
 
     When a conversation ran inside a Cowork session with a user-selected
     workspace folder, tool-call arguments and file paths typically reference
-    ``/sessions/<nickname>/mnt/<real-folder>/...``. Counting those and
-    picking the most-seen ``<real-folder>`` gives us the actual project the
-    user was working in — something much friendlier than the session
-    nickname (e.g. "history browser" instead of "epic-intelligent-fermat").
+    ``/sessions/<nickname>/mnt/<real-folder>/...`` — and Cowork's system
+    prompt explicitly records a ``Folder: /sessions/<nick>/mnt/<folder>``
+    line. Counting those references and picking the most-seen ``<folder>``
+    gives us the actual project the user was working in (e.g. "history
+    browser" instead of "vigilant-keen-davinci").
     """
     mount_counts = Counter()
     mount_to_session: dict[str, str] = {}
     try:
-        files = sorted(parent.glob("*.jsonl"))[:5]  # cap I/O for big folders
+        files = sorted(parent.glob("*.jsonl"))[:8]  # cap I/O for big folders
     except Exception:
         return None, None
 
@@ -363,13 +364,23 @@ def _scan_cowork_mount(parent: Path) -> tuple[str | None, str | None]:
         try:
             with open(f, encoding="utf-8", errors="replace") as fh:
                 for i, line in enumerate(fh):
-                    if i >= 40:  # first 40 lines usually contain the cwd
-                        break    # and the system-prompt with the folder path
+                    # System-prompt text usually arrives within the first
+                    # ~200 lines; cap well above 40 so we don't miss it in
+                    # long conversations that start with a lot of tool use.
+                    if i >= 250:
+                        break
+                    # JSON sometimes escapes slashes as "\/" — normalize so
+                    # our regex can match paths embedded inside JSON strings.
+                    if "\\/" in line:
+                        line = line.replace("\\/", "/")
                     for m in _COWORK_MOUNT_REGEX.finditer(line):
                         sess = m.group(1)
                         mount = m.group(2).strip().strip("/")
-                        # Skip hidden/plumbing folders like .claude, .local-plugins
-                        if not mount or mount.startswith(".") or mount.startswith("tmp"):
+                        # Skip obvious plumbing mounts (hidden dot-dirs like
+                        # .claude, .local-plugins). A user-named folder that
+                        # starts with "tmp" is perfectly legitimate, so we
+                        # do NOT filter those anymore.
+                        if not mount or mount.startswith("."):
                             continue
                         mount_counts[mount] += 1
                         mount_to_session.setdefault(mount, sess)
@@ -424,12 +435,17 @@ def project_info(filepath: Path) -> dict:
 
     session: str | None = None
     if cwd:
-        name = os.path.basename(cwd.rstrip("/\\")) or cwd
-        # If cwd is a Cowork session root (e.g. /sessions/vigilant-keen-davinci),
-        # the basename is just the session nickname — that's not very useful
-        # as a "project" label. Dig into the JSONL to find the mounted folder
-        # the user actually worked in and prefer that name instead.
-        if _looks_like_cowork_session(name):
+        cwd_stripped = cwd.rstrip("/\\")
+        name = os.path.basename(cwd_stripped) or cwd_stripped
+        # Only treat this as a Cowork session when the full cwd actually
+        # starts with "/sessions/" AND the basename matches the nickname
+        # pattern — otherwise a regular local repo like ~/code/claude-history-browser
+        # would be mistakenly "resolved" to some mount.
+        is_cowork_root = (
+            cwd_stripped.startswith("/sessions/")
+            and _looks_like_cowork_session(name)
+        )
+        if is_cowork_root:
             mount, sess = _scan_cowork_mount(parent)
             if mount:
                 session = sess or name
@@ -439,8 +455,13 @@ def project_info(filepath: Path) -> dict:
     else:
         # 2. Fall back to decoding the folder name on disk.
         decoded = _decode_claude_folder_name(parent.name)
-        name = os.path.basename(decoded.rstrip("/\\")) or parent.name
-        if _looks_like_cowork_session(name):
+        decoded_stripped = decoded.rstrip("/\\")
+        name = os.path.basename(decoded_stripped) or parent.name
+        is_cowork_root = (
+            decoded_stripped.startswith("/sessions/")
+            and _looks_like_cowork_session(name)
+        )
+        if is_cowork_root:
             mount, sess = _scan_cowork_mount(parent)
             if mount:
                 session = sess or name
