@@ -1414,6 +1414,7 @@ let displayedConversations = []; // after client-side day filter
 let currentProject = '';
 let dayFilter = '';          // yyyy-mm-dd (client side)
 let selected = new Set();    // conv ids selected for download
+let currentTurnIndex = -1;   // index of the focused .turn in the reading pane (-1 = none)
 
 // ── Splitter / resizer ───────────────────────────────────────────────────────
 function setSidebarWidth(px) {
@@ -1728,9 +1729,10 @@ async function openConversation(c) {
 
 function renderConversation(turns, container) {
   container.innerHTML = '';
-  turns.forEach(turn => {
+  turns.forEach((turn, idx) => {
     const div = document.createElement('div');
     div.className = `turn ${turn.role}`;
+    div.dataset.turnIndex = String(idx);
 
     const label = document.createElement('div');
     label.className = 'turn-label';
@@ -1763,6 +1765,11 @@ function renderConversation(turns, container) {
     container.appendChild(div);
   });
   container.scrollTop = 0;
+
+  // Reset the active-turn cursor to the first turn (if any). No scroll here —
+  // the reader is already at the top; the keyboard handler will scroll on move.
+  currentTurnIndex = turns.length ? 0 : -1;
+  setActiveTurn(currentTurnIndex, {scroll: false});
 }
 
 // ── Download selected as Markdown ────────────────────────────────────────────
