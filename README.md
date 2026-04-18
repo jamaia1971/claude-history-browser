@@ -106,6 +106,28 @@ Each subfolder becomes a "project" in the UI. Each `.jsonl` becomes a conversati
    - Watch the **token badge** next to "✦ Claude" labels to spot expensive replies.
 7. **Export**: tick the checkboxes for the conversations you want, then click **⬇︎ Download (N)**. You'll get a single `.md` file like `claude-history-20260417-173411.md` containing all the selected threads, cleanly formatted.
 
+### How the filter chips work
+
+The five chips in the reader toolbar each target **one type of content**, not whole turns. A message bubble stays visible as long as **at least one** of its blocks is visible — so you can, for example, turn CLAUDE off and TOOL on and still see Claude's tool-call turns (just without the prose).
+
+| Chip | What it shows / hides |
+|------|-----------------------|
+| **👤 You** | The text you typed, plus `[Image:…]` and `<system-reminder>` metadata that came from your side. |
+| **✦ Claude** | Claude's **prose** replies only. Does **not** touch tool calls, thinking, or results — those have their own chips. |
+| **🔧 Tool** | The 🔧 tool-call blocks inside Claude's turns (what Claude asked a tool to do). |
+| **🧠 Thinking** | The 🧠 internal reasoning blocks inside Claude's turns. |
+| **📤 Result** | 📤 tool outputs and ⚙️ system-injected turns that sit between tool calls and Claude's next reply. |
+
+All chips start **ON** (everything shown). Click one to turn it off. Useful combinations:
+
+- **You + Claude** → a clean human/Claude conversation, with all the tool chatter, thinking, and results collapsed out.
+- **Only Tool** → every Claude turn that made a tool call, showing just the 🔧 blocks. Handy for spotting what tools ran and with what inputs.
+- **Only Thinking** → Claude's reasoning path end-to-end, without the work itself.
+- **Tool + Result** → the execution log: what Claude asked for, what came back, nothing else.
+- **Claude + Result** → Claude's replies plus the tool outputs that informed them, without the intermediate tool-call plumbing.
+
+Your chip preferences persist across browser sessions, so once you pick a view you like for reading old transcripts you won't have to set it up again.
+
 ---
 
 ## How it works (very short version)
