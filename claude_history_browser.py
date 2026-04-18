@@ -1460,11 +1460,11 @@ HTML_TEMPLATE = r"""
     <div id="conv-toolbar">
       <div class="filter-row">
         <span class="filter-label">Show:</span>
-        <button class="filter-btn-ct on" data-filter="you"      type="button" title="Show/hide turns that contain text you actually typed.">👤 You</button>
-        <button class="filter-btn-ct on" data-filter="claude"   type="button" title="Show/hide Claude's replies (assistant turns).">✦ Claude</button>
-        <button class="filter-btn-ct on" data-filter="tool"     type="button" title="Show/hide tool-call blocks (🔧 ToolName — what Claude asked a tool to do).">🔧 Tool</button>
-        <button class="filter-btn-ct on" data-filter="thinking" type="button" title="Show/hide Claude's internal reasoning blocks (🧠 Thinking).">🧠 Thinking</button>
-        <button class="filter-btn-ct on" data-filter="result"   type="button" title="Show/hide tool output / system-injected turns (📤 Tool result, ⚙️ System).">📤 Result</button>
+        <button class="filter-btn-ct on" data-filter="you"      type="button" title="Show/hide the text you typed (plus [Image:…] and system-reminder metadata that came from your side).">👤 You</button>
+        <button class="filter-btn-ct on" data-filter="claude"   type="button" title="Show/hide Claude's prose replies. Does NOT hide the tool calls / thinking / results that sit alongside them — those have their own chips.">✦ Claude</button>
+        <button class="filter-btn-ct on" data-filter="tool"     type="button" title="Show/hide 🔧 tool-call blocks (what Claude asked a tool to do). Leaves the surrounding Claude message in place.">🔧 Tool</button>
+        <button class="filter-btn-ct on" data-filter="thinking" type="button" title="Show/hide 🧠 internal reasoning blocks. Leaves the surrounding Claude message in place.">🧠 Thinking</button>
+        <button class="filter-btn-ct on" data-filter="result"   type="button" title="Show/hide 📤 tool outputs and ⚙️ system-injected turns. These appear between Claude's calls and her next reply.">📤 Result</button>
       </div>
       <button id="compact-toggle" type="button" title="Clip long tool inputs and tool results at ~240px with an inner scrollbar, so you can scan a long conversation faster. Toggle off to see each block in full.">🗜 Compact tool blocks</button>
     </div>
@@ -1524,33 +1524,56 @@ function applyFilters() {
   if (!view) return;
   const turns = view.querySelectorAll('.turn');
   turns.forEach(turnEl => {
-    // Turn-level visibility first. Our classifier writes the kind onto
-    // `turn.<kind>`: user | assistant | tool-result | system.
-    let turnHidden = false;
-    if (turnEl.classList.contains('user') && !FILTERS.you) turnHidden = true;
-    if (turnEl.classList.contains('assistant') && !FILTERS.claude) turnHidden = true;
-    if ((turnEl.classList.contains('tool-result') || turnEl.classList.contains('system'))
-        && !FILTERS.result) turnHidden = true;
+    const isUser      = turnEl.classList.contains('user');
+    const isAssistant = turnEl.classList.contains('assistant');
+    const isToolRes   = turnEl.classList.contains('tool-result');
+    const isSystem    = turnEl.classList.contains('system');
 
-    // Block-level visibility inside assistant turns (tool_use, thinking) and
-    // inside any turn for tool_result leftovers. We toggle each block's own
-    // display, then — if every block ends up hidden — hide the whole turn so
-    // we don't leave an empty bubble behind.
+    // Block-level visibility. Each block type maps to exactly one chip:
+    //   .block-text    inside a user turn       → YOU
+    //   .block-text    inside an assistant turn → CLAUDE
+    //   .block-thinking (always in assistant)   → THINKING
+    //   .block-tool    (always in assistant)    → TOOL
+    //   .block-result                            → RESULT
+    //   .block-meta    (image markers, system-reminders in user turn) → YOU
+    //     (meta blocks are muted filler that sits alongside the user's real
+    //     typed text; hiding YOU should take them with it so the bubble
+    //     doesn't stay visible as just a grey metadata line.)
+    //
+    // A block starts visible and can be flipped hidden by the matching OFF
+    // chip. The turn then shows iff at least one of its blocks is visible.
     const blocks = turnEl.querySelectorAll('.block');
     let anyVisible = false;
     blocks.forEach(b => {
-      let hide = false;
-      if (b.classList.contains('block-tool')     && !FILTERS.tool)     hide = true;
-      if (b.classList.contains('block-thinking') && !FILTERS.thinking) hide = true;
-      if (b.classList.contains('block-result')   && !FILTERS.result)   hide = true;
-      b.style.display = hide ? 'none' : '';
-      if (!hide) anyVisible = true;
+      let show = true;
+      if (b.classList.contains('block-text')) {
+        if (isUser && !FILTERS.you) show = false;
+        if (isAssistant && !FILTERS.claude) show = false;
+      }
+      if (b.classList.contains('block-thinking') && !FILTERS.thinking) show = false;
+      if (b.classList.contains('block-tool')     && !FILTERS.tool)     show = false;
+      if (b.classList.contains('block-result')   && !FILTERS.result)   show = false;
+      if (b.classList.contains('block-meta')     && !FILTERS.you)      show = false;
+      b.style.display = show ? '' : 'none';
+      if (show) anyVisible = true;
     });
 
-    // If the turn has no blocks at all (rare), treat the label alone as
-    // content and let turn-level rules decide.
-    const hasBlocks = blocks.length > 0;
-    const hideByEmpty = hasBlocks && !anyVisible;
+    // Category-level gates for turns whose identity isn't captured by their
+    // blocks. "Tool result" and "System" user-role turns sit under RESULT in
+    // the UI, so RESULT's chip state governs them even though the individual
+    // block rules above would already hide them via .block-result / .block-meta.
+    let turnHidden = false;
+    if ((isToolRes || isSystem) && !FILTERS.result) turnHidden = true;
+
+    // Empty-turn fallback (a turn with no .block children, which shouldn't
+    // normally happen but defends against future parser changes): use the
+    // classifier kind to decide visibility.
+    if (!blocks.length) {
+      if (isUser && !FILTERS.you) turnHidden = true;
+      if (isAssistant && !FILTERS.claude) turnHidden = true;
+    }
+
+    const hideByEmpty = blocks.length > 0 && !anyVisible;
     turnEl.style.display = (turnHidden || hideByEmpty) ? 'none' : '';
   });
 
