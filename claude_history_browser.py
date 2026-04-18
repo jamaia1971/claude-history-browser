@@ -1292,7 +1292,14 @@ HTML_TEMPLATE = r"""
   .turn-label { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 6px; }
   .turn.user .turn-label { color: var(--accent2); }
   .turn.assistant .turn-label { color: var(--accent); }
-  .bubble { border-radius: var(--radius); padding: 12px 16px; font-size: 13px; line-height: 1.6; transition: outline-color 0.15s ease; }
+  /* padding-right leaves room for the per-turn copy button in the top-right. */
+  .bubble { position: relative; border-radius: var(--radius); padding: 12px 64px 12px 16px; font-size: 13px; line-height: 1.6; transition: outline-color 0.15s ease; }
+  /* Per-turn copy button — always visible at low opacity for discoverability,
+     full opacity on bubble hover, and a brief green flash on successful copy. */
+  .copy-turn-btn { position: absolute; top: 6px; right: 6px; background: rgba(0,0,0,0.25); border: 1px solid var(--border); color: var(--text3); border-radius: 4px; padding: 3px 8px; font-size: 10px; font-family: inherit; line-height: 1; cursor: pointer; opacity: 0.45; transition: opacity 0.15s ease, color 0.15s ease, border-color 0.15s ease, background 0.15s ease; }
+  .bubble:hover .copy-turn-btn { opacity: 1; }
+  .copy-turn-btn:hover { color: var(--accent); border-color: var(--accent); }
+  .copy-turn-btn.flash { opacity: 1; background: var(--accent); color: var(--bg); border-color: var(--accent); }
   .turn.user .bubble { background: var(--user-bg); }
   .turn.assistant .bubble { background: var(--asst-bg); }
   .turn.active-turn .bubble { outline: 2px solid var(--accent); outline-offset: 3px; }
@@ -1828,11 +1835,19 @@ document.addEventListener('keydown', (ev) => {
   moveTurn(ev.key === 'ArrowDown' ? 1 : -1);
 });
 
-// Clicking anywhere inside a turn moves the active-turn cursor there, so
-// subsequent ↑/↓ navigation continues from the spot the user just picked.
-// We use event delegation on #conv-view and skip scrolling — the click is a
-// pointer action, the target is already on screen.
+// Delegated click handler for the reading pane. Handles two things:
+//   1. Copy button inside a bubble → write the turn's pre-computed text to
+//      clipboard and flash the button. Stops propagation so it doesn't also
+//      trigger the click-to-activate path below.
+//   2. Any other click inside a .turn → move the active-turn cursor there,
+//      so subsequent ↑/↓ navigation continues from the spot the user picked.
 document.getElementById('conv-view').addEventListener('click', (ev) => {
+  const copyBtn = ev.target.closest && ev.target.closest('.copy-turn-btn');
+  if (copyBtn) {
+    copyTurnText(copyBtn);
+    ev.stopPropagation();
+    return;
+  }
   const turnEl = ev.target.closest && ev.target.closest('.turn');
   if (!turnEl) return;
   const idx = parseInt(turnEl.dataset.turnIndex, 10);
@@ -1860,6 +1875,56 @@ function classifyTurn(turn) {
   return {kind: 'user', label: '👤 You'};
 }
 
+// Build a plain-text copy payload for a turn. Keeps light separators so a
+// thinking / tool-use / tool-result stays distinguishable when pasted.
+function buildTurnCopyText(turn) {
+  const parts = [];
+  (turn.blocks || []).forEach(b => {
+    if (!b) return;
+    if (b.type === 'text')        parts.push(b.text || '');
+    else if (b.type === 'thinking')    parts.push('🧠 Thinking\n' + (b.text || ''));
+    else if (b.type === 'tool_use')    parts.push('🔧 ' + (b.name || 'tool') + '\n' + (b.input || ''));
+    else if (b.type === 'tool_result') parts.push('📤 Result\n' + (b.text || ''));
+  });
+  return parts.join('\n\n').trim();
+}
+
+function flashCopyBtn(btn, ok) {
+  const prev = btn.textContent;
+  btn.textContent = ok ? '✓ Copied' : '✗ Failed';
+  btn.classList.add('flash');
+  setTimeout(() => {
+    btn.textContent = prev;
+    btn.classList.remove('flash');
+  }, 1100);
+}
+
+function copyTurnText(btn) {
+  const turnEl = btn.closest('.turn');
+  if (!turnEl) return;
+  const text = turnEl.dataset.copyText || '';
+  try {
+    const p = navigator.clipboard && navigator.clipboard.writeText(text);
+    if (p && typeof p.then === 'function') {
+      p.then(() => flashCopyBtn(btn, true)).catch(() => flashCopyBtn(btn, false));
+    } else {
+      // Legacy fallback — synchronous execCommand via a hidden textarea.
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      ta.setAttribute('readonly', '');
+      ta.style.position = 'fixed';
+      ta.style.top = '-9999px';
+      document.body.appendChild(ta);
+      ta.select();
+      const ok = document.execCommand('copy');
+      ta.remove();
+      flashCopyBtn(btn, !!ok);
+    }
+  } catch (e) {
+    flashCopyBtn(btn, false);
+  }
+}
+
 function renderConversation(turns, container) {
   container.innerHTML = '';
   turns.forEach((turn, idx) => {
@@ -1867,6 +1932,9 @@ function renderConversation(turns, container) {
     const div = document.createElement('div');
     div.className = `turn ${kind}`;
     div.dataset.turnIndex = String(idx);
+    // Pre-compute the clean text payload so the copy button doesn't have to
+    // re-parse the DOM (which would also pick up the button's own label).
+    div.dataset.copyText = buildTurnCopyText(turn);
 
     const label = document.createElement('div');
     label.className = 'turn-label';
@@ -1875,6 +1943,14 @@ function renderConversation(turns, container) {
 
     const bubble = document.createElement('div');
     bubble.className = 'bubble';
+
+    const copyBtn = document.createElement('button');
+    copyBtn.type = 'button';
+    copyBtn.className = 'copy-turn-btn';
+    copyBtn.title = 'Copy this message to clipboard';
+    copyBtn.setAttribute('aria-label', 'Copy message');
+    copyBtn.textContent = '📋 Copy';
+    bubble.appendChild(copyBtn);
 
     (turn.blocks || []).forEach(block => {
       const bd = document.createElement('div');
