@@ -1301,10 +1301,14 @@ HTML_TEMPLATE = r"""
   .block-thinking .think-body { white-space: pre-wrap; margin-top: 6px; }
   .block-tool { background: var(--tool-bg); border: 1px solid #1e3020; border-radius: 6px; padding: 8px 12px; }
   .block-tool .tool-name { font-size: 11px; font-weight: 700; color: #6dcc88; text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 4px; }
-  .block-tool pre { font-size: 11px; color: #8ecf9e; white-space: pre-wrap; word-break: break-all; overflow: hidden; max-height: 200px; }
+  /* No max-height / overflow cap here: earlier versions clipped tool inputs
+     at 200px with overflow:hidden, which silently cut off the end of long
+     Edit/Write payloads (invisibly — there was no scrollbar). Show the full
+     content inline; the reader pane itself scrolls. */
+  .block-tool pre { font-size: 11px; color: #8ecf9e; white-space: pre-wrap; word-break: break-all; }
   .block-result { background: var(--result-bg); border: 1px solid #1a2535; border-radius: 6px; padding: 8px 12px; }
   .block-result .result-label { font-size: 11px; font-weight: 600; color: var(--text3); margin-bottom: 4px; }
-  .block-result pre { font-size: 11px; color: var(--text2); white-space: pre-wrap; word-break: break-all; max-height: 200px; overflow: hidden; }
+  .block-result pre { font-size: 11px; color: var(--text2); white-space: pre-wrap; word-break: break-all; }
 
   /* ── Search results ── */
   #search-results { flex: 1; overflow-y: auto; padding: 16px 24px; display: none; }
@@ -1778,6 +1782,18 @@ document.addEventListener('keydown', (ev) => {
   if (!view || view.style.display === 'none' || view.offsetParent === null) return;
   ev.preventDefault();
   moveTurn(ev.key === 'ArrowDown' ? 1 : -1);
+});
+
+// Clicking anywhere inside a turn moves the active-turn cursor there, so
+// subsequent ↑/↓ navigation continues from the spot the user just picked.
+// We use event delegation on #conv-view and skip scrolling — the click is a
+// pointer action, the target is already on screen.
+document.getElementById('conv-view').addEventListener('click', (ev) => {
+  const turnEl = ev.target.closest && ev.target.closest('.turn');
+  if (!turnEl) return;
+  const idx = parseInt(turnEl.dataset.turnIndex, 10);
+  if (Number.isNaN(idx)) return;
+  setActiveTurn(idx, {scroll: false});
 });
 
 function renderConversation(turns, container) {
