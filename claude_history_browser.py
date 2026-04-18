@@ -1267,9 +1267,10 @@ HTML_TEMPLATE = r"""
   .turn-label { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 6px; }
   .turn.user .turn-label { color: var(--accent2); }
   .turn.assistant .turn-label { color: var(--accent); }
-  .bubble { border-radius: var(--radius); padding: 12px 16px; font-size: 13px; line-height: 1.6; }
+  .bubble { border-radius: var(--radius); padding: 12px 16px; font-size: 13px; line-height: 1.6; transition: outline-color 0.15s ease; }
   .turn.user .bubble { background: var(--user-bg); }
   .turn.assistant .bubble { background: var(--asst-bg); }
+  .turn.active-turn .bubble { outline: 2px solid var(--accent); outline-offset: 3px; }
 
   /* ── Content blocks ── */
   .block + .block { margin-top: 8px; }
