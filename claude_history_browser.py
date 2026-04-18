@@ -1727,6 +1727,59 @@ async function openConversation(c) {
   renderConversation(data.turns, view);
 }
 
+// ── Reading-pane keyboard navigation ─────────────────────────────────────────
+//
+// UP/DOWN arrows move the "active turn" cursor through the selected
+// conversation's messages. The active turn gets a subtle outline around its
+// bubble and is smooth-scrolled into view. We only intercept the keys when:
+//   - the reading pane (#conv-view) is visible,
+//   - the active element isn't an input/textarea/select/contenteditable,
+//   - no modifier key (Ctrl/Meta/Alt) is held — so Cmd-Up / Cmd-Down still
+//     jump to top/bottom as the browser normally does.
+
+function setActiveTurn(idx, {scroll = true} = {}) {
+  const view = document.getElementById('conv-view');
+  if (!view) return;
+  const turns = view.querySelectorAll('.turn');
+  if (!turns.length) { currentTurnIndex = -1; return; }
+  // Clamp
+  if (idx < 0) idx = 0;
+  if (idx >= turns.length) idx = turns.length - 1;
+  // Clear previous highlight
+  view.querySelectorAll('.turn.active-turn').forEach(el => el.classList.remove('active-turn'));
+  const el = turns[idx];
+  if (!el) return;
+  el.classList.add('active-turn');
+  currentTurnIndex = idx;
+  if (scroll) {
+    el.scrollIntoView({behavior: 'smooth', block: 'center'});
+  }
+}
+
+function moveTurn(delta) {
+  const view = document.getElementById('conv-view');
+  if (!view) return;
+  const turns = view.querySelectorAll('.turn');
+  if (!turns.length) return;
+  const start = currentTurnIndex < 0 ? (delta > 0 ? -1 : turns.length) : currentTurnIndex;
+  setActiveTurn(start + delta);
+}
+
+document.addEventListener('keydown', (ev) => {
+  if (ev.key !== 'ArrowUp' && ev.key !== 'ArrowDown') return;
+  if (ev.ctrlKey || ev.metaKey || ev.altKey) return;
+  // Skip when typing in an input-ish element
+  const t = ev.target;
+  if (t) {
+    const tag = (t.tagName || '').toLowerCase();
+    if (tag === 'input' || tag === 'textarea' || tag === 'select' || t.isContentEditable) return;
+  }
+  const view = document.getElementById('conv-view');
+  if (!view || view.style.display === 'none' || view.offsetParent === null) return;
+  ev.preventDefault();
+  moveTurn(ev.key === 'ArrowDown' ? 1 : -1);
+});
+
 function renderConversation(turns, container) {
   container.innerHTML = '';
   turns.forEach((turn, idx) => {
