@@ -1296,6 +1296,18 @@ HTML_TEMPLATE = r"""
   .turn.user .bubble { background: var(--user-bg); }
   .turn.assistant .bubble { background: var(--asst-bg); }
   .turn.active-turn .bubble { outline: 2px solid var(--accent); outline-offset: 3px; }
+  /* Tool result turns: Claude's API wraps tool outputs in user-role messages,
+     so they arrive labeled "user" but were never typed by the human. We show
+     them in a quieter result-toned bubble so they're clearly distinguishable
+     from actual user text. */
+  .turn.tool-result .turn-label { color: var(--text3); }
+  .turn.tool-result .bubble { background: var(--result-bg); border-left: 3px solid var(--border); }
+  /* System turns: blocks that are purely synthetic — system-reminders, image
+     markers, command messages — injected by the client rather than the user. */
+  .turn.system .turn-label { color: var(--text3); }
+  .turn.system .bubble { background: var(--surface); opacity: 0.85; border-left: 3px solid var(--border); }
+  /* Inline meta blocks: a single metadata line inside an otherwise-user turn. */
+  .block-meta { color: var(--text3); font-size: 11px; font-style: italic; opacity: 0.8; padding: 4px 8px; border-left: 2px solid var(--border); white-space: pre-wrap; word-break: break-word; }
 
   /* ── Content blocks ── */
   .block + .block { margin-top: 8px; }
@@ -1828,16 +1840,37 @@ document.getElementById('conv-view').addEventListener('click', (ev) => {
   setActiveTurn(idx, {scroll: false});
 });
 
+// The JSONL `user` role is the Anthropic API's catch-all for "anything the
+// assistant didn't produce." That includes the human's typed text, but also
+// tool_result blocks (required by the API to live under a user message) and
+// synthetic metadata blocks injected by the client (system reminders, image
+// markers, /command messages). We classify the turn so the UI can label it
+// honestly instead of pretending the human wrote all of it.
+const META_TEXT_RE = /^\s*(?:\[Image:|<system-reminder>|<command-name>|<command-message>|<command-args>)/;
+function isMetaTextBlock(b) {
+  return b && b.type === 'text' && typeof b.text === 'string' && META_TEXT_RE.test(b.text);
+}
+function classifyTurn(turn) {
+  if (turn.role !== 'user') return {kind: turn.role, label: '✦ Claude'};
+  const blocks = turn.blocks || [];
+  if (!blocks.length) return {kind: 'user', label: '👤 You'};
+  const isToolResult = b => b.type === 'tool_result';
+  if (blocks.every(isToolResult)) return {kind: 'tool-result', label: '📤 Tool result'};
+  if (blocks.every(b => isToolResult(b) || isMetaTextBlock(b))) return {kind: 'system', label: '⚙️ System'};
+  return {kind: 'user', label: '👤 You'};
+}
+
 function renderConversation(turns, container) {
   container.innerHTML = '';
   turns.forEach((turn, idx) => {
+    const {kind, label: labelText} = classifyTurn(turn);
     const div = document.createElement('div');
-    div.className = `turn ${turn.role}`;
+    div.className = `turn ${kind}`;
     div.dataset.turnIndex = String(idx);
 
     const label = document.createElement('div');
     label.className = 'turn-label';
-    label.textContent = turn.role === 'user' ? '👤 You' : '✦ Claude';
+    label.textContent = labelText;
     div.appendChild(label);
 
     const bubble = document.createElement('div');
@@ -1847,8 +1880,16 @@ function renderConversation(turns, container) {
       const bd = document.createElement('div');
       bd.className = 'block';
       if (block.type === 'text') {
-        bd.className += ' block-text';
-        bd.textContent = block.text;
+        // Inside a regular user turn, a single metadata line (image marker,
+        // system-reminder) gets muted styling instead of being rendered as
+        // the user's speech — keeps the real typed text visually dominant.
+        if (kind === 'user' && isMetaTextBlock(block)) {
+          bd.className += ' block-meta';
+          bd.textContent = block.text;
+        } else {
+          bd.className += ' block-text';
+          bd.textContent = block.text;
+        }
       } else if (block.type === 'thinking') {
         bd.className += ' block-thinking';
         bd.innerHTML = `<details><summary>🧠 Thinking</summary><div class="think-body">${esc(block.text)}</div></details>`;
