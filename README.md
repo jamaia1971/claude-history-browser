@@ -84,6 +84,8 @@ Each subfolder becomes a "project" in the UI. Each `.jsonl` becomes a conversati
 
 > ⚠️ **Claude Code auto-deletes local history after 30 days by default.** This browser can only show what's still on disk, so if you care about long-term scrollback, take a minute to raise `cleanupPeriodDays` in `~/.claude/settings.json` — or archive the folder elsewhere. See **[HISTORY_RETENTION.md](HISTORY_RETENTION.md)** for a full explanation, the one config tweak that matters, and a ready-to-use archive recipe.
 
+> 📖 **When something in the reader looks odd, read [TRANSCRIPT_NOTES.md](TRANSCRIPT_NOTES.md).** It walks through the JSONL format's quirks — why a "user" turn might actually be a tool result, why some thinking blocks are empty, what the cumulative token counts really mean, and which records the reader deliberately ignores. If you're going to spend much time squinting at your history, that doc saves confusion.
+
 ---
 
 ## How to use it
