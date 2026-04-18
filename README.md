@@ -26,7 +26,15 @@ If you use Claude Code or Cowork day-to-day, this little app may save you a lot 
 
 - **Scans** a folder (recursively) for `.jsonl` conversation files — works with Claude Code's `~/.claude/projects/` layout, Cowork sessions, or any folder you point it at.
 - **Lists** every conversation in a sortable, filterable table with these columns: a **checkbox**, the **title + preview**, **date & hour**, and **project**. Click the date cell to filter to that day; click the project cell to filter to that project. Active filters show as pills you can clear with one click.
-- **Displays** a selected conversation in a clean chat-like view, with styled blocks for plain text, thinking blocks (collapsible), tool calls, and tool results.
+- **Displays** a selected conversation in a clean chat-like view, with styled blocks for plain text, thinking blocks (collapsible), tool calls, and tool results. Each turn is clearly labeled: **👤 You**, **✦ Claude**, **📤 Tool result**, or **⚙️ System**.
+- **Reader toolbar** under the conversation header lets you isolate parts of a thread with one click:
+  - **Category chips** — **👤 You / ✦ Claude / 🔧 Tool / 🧠 Thinking / 📤 Result** — toggle each independently to filter the transcript (e.g., hide tool chatter to read only the human/Claude conversation).
+  - **🗜 Compact tool blocks** — clips long tool inputs and tool results at ~240px with an inner scrollbar so you can scan big transcripts faster.
+  - Your filter/compact preferences persist across browser sessions.
+- **Keyboard navigation** — **↑ / ↓** arrow keys step through turns in the open conversation. Click anywhere in a turn to set the active position, and arrows continue from there.
+- **Per-turn Copy button** — every message has a **📋 Copy** button in its top-right corner that copies a clean text payload (no button labels, no DOM noise) to your clipboard.
+- **Per-turn token badge** — each Claude reply shows a small `N in / M out` badge next to its label, so you can see which single response was the expensive one. Hover for full counts.
+- **Conversation-level token totals** — the header shows cumulative input/output for the whole thread, with a tooltip breaking out cache-read and cache-write so prompt-caching savings are visible at a glance.
 - **Full-text search** across every conversation in your history folder, with excerpts.
 - **Exports** any subset of conversations to a single Markdown file: tick the checkboxes, click **⬇︎ Download (N)**, save the `.md`. Great for sharing a thread, feeding it back to Claude, or archiving.
 - **Change folder at runtime** via a macOS Finder dialog or by pasting a path.
@@ -85,7 +93,14 @@ Each subfolder becomes a "project" in the UI. Each `.jsonl` becomes a conversati
    - Active filters appear as pills — click the `✕` to clear them.
 4. **Search**: type into the search bar at the top and press Enter. The results panel shows matching conversations with snippets.
 5. **Read**: click any conversation row (not the checkbox) to open it in the reader pane on the right.
-6. **Export**: tick the checkboxes for the conversations you want, then click **⬇︎ Download (N)**. You'll get a single `.md` file like `claude-history-20260417-173411.md` containing all the selected threads, cleanly formatted.
+6. **Navigate inside a conversation**:
+   - **↑ / ↓** arrow keys step through turns; the active turn is highlighted and smooth-scrolled into view.
+   - **Click** anywhere inside a turn to set it as the active position — arrows continue from there.
+   - **Category chips** (👤 / ✦ / 🔧 / 🧠 / 📤) in the toolbar isolate the parts you want to see.
+   - **🗜 Compact tool blocks** clips long tool dumps so you can skim; toggle it off to see everything in full.
+   - **📋 Copy** on any turn copies just that message to your clipboard.
+   - Watch the **token badge** next to "✦ Claude" labels to spot expensive replies.
+7. **Export**: tick the checkboxes for the conversations you want, then click **⬇︎ Download (N)**. You'll get a single `.md` file like `claude-history-20260417-173411.md` containing all the selected threads, cleanly formatted.
 
 ---
 
@@ -155,7 +170,7 @@ This app does the boring-but-useful stuff: open the files, list them, search the
 - Split the single-file app into modules (Flask blueprints, templates extracted from the `HTML_TEMPLATE` string, static assets as real files).
 - A proper package install (`pip install claude-history-browser`) with a console entry point.
 - Dark/light theme toggle.
-- Keyboard shortcuts for power users (`j`/`k` to move through conversations, `/` to focus search, etc.).
+- More keyboard shortcuts for power users (`j`/`k` to move through the conversation list, `/` to focus search, `c` to copy the active turn, etc. — arrow-key navigation *within* a conversation already works).
 
 ## Contributing
 
