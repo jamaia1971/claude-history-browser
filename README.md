@@ -68,6 +68,10 @@ Flask is installed automatically on first run if you don't already have it.
 - Flask (auto-installed if missing)
 - macOS for the native Finder folder-picker. On Linux/Windows you can still use the app — just paste the path when prompted, or see *[Linux / Windows tip](#linux--windows-tip)* below.
 
+### Tested on
+
+I developed and use this app on **macOS (Apple Silicon)** with **Safari**. Everything below was written and debugged in that environment. On **Chrome / Firefox / Edge** it should still work — the frontend is plain HTML + vanilla JS with no Safari-specific APIs — but I haven't verified every small behavior (clipboard permissions, smooth-scroll easing, scrollbar styling, minor CSS rendering) on those browsers. On **Windows / Linux** the folder picker falls back to a paste-the-path prompt (see the *Linux / Windows tip* below) but the rest of the app is the same cross-platform Flask. If you spot a browser-specific or OS-specific glitch, please open an issue.
+
 ### Where Claude history lives
 
 | Tool | Default history path |
@@ -119,7 +123,7 @@ Everything is local. The server binds to `127.0.0.1` only. Nothing ever leaves y
 
 ## Linux / Windows tip
 
-> ⚠️ **Full disclosure:** I have no idea whether any of the Windows instructions anywhere in this repo actually work. I've been a Mac user for so long I cannot remember my last Windows version, so anything Windows-specific here was proposed by Claude and has never been tested by me on a real Windows machine. If you run into trouble on Windows, please open an issue — or better yet, a PR with a version that actually works.
+> ⚠️ **Full disclosure:** I use this app on **macOS (Apple Silicon)** with **Safari**, and that's the only combination I've actually tested. I have no idea whether any of the Windows instructions anywhere in this repo actually work — I've been a Mac user for so long I cannot remember my last Windows version, so anything Windows-specific here was proposed by Claude and has never been tested by me on a real Windows machine. Same caveat for **Chrome / Firefox / Edge** on any platform: the UI is plain HTML + vanilla JS so it *should* just work, but small things (clipboard permissions, smooth-scroll, scrollbar appearance) may differ. If you run into trouble on Windows or in a non-Safari browser, please open an issue — or better yet, a PR with a version that actually works.
 
 The folder picker uses AppleScript (`osascript`) because I'm on macOS. On other platforms it will just fall back to asking you to paste a path, which works fine. If you want a native dialog anyway, swap `pick_folder_mac()` for a `tkinter` version:
 
