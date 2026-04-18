@@ -685,15 +685,27 @@ def api_conversation(conv_id):
         if t not in ("user", "assistant"):
             continue
         content = m.get("message", {}).get("content", "")
-        turns.append(
-            {
-                "role": t,
-                "blocks": content_blocks(content),
-                "timestamp": m.get("timestamp"),
-                "uuid": m.get("uuid"),
-                "model": m.get("message", {}).get("model"),
-            }
-        )
+        # Per-turn token usage. Only assistant turns carry a `usage` dict
+        # (the API emits it with the response). We surface just input +
+        # output here — the conversation-level tooltip still shows the
+        # cache-read / cache-write breakdown for the whole thread.
+        turn = {
+            "role": t,
+            "blocks": content_blocks(content),
+            "timestamp": m.get("timestamp"),
+            "uuid": m.get("uuid"),
+            "model": m.get("message", {}).get("model"),
+        }
+        if t == "assistant":
+            usage = (m.get("message") or {}).get("usage") or {}
+            try:
+                turn["tokens_in"] = int(usage.get("input_tokens") or 0)
+                turn["tokens_out"] = int(usage.get("output_tokens") or 0)
+            except (TypeError, ValueError):
+                # Defensive: older transcripts may have malformed counters.
+                turn["tokens_in"] = 0
+                turn["tokens_out"] = 0
+        turns.append(turn)
     return jsonify({"turns": turns, "total": len(turns)})
 
 
@@ -1301,6 +1313,9 @@ HTML_TEMPLATE = r"""
   .turn-label { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 6px; }
   .turn.user .turn-label { color: var(--accent2); }
   .turn.assistant .turn-label { color: var(--accent); }
+  /* Per-turn token badge sits inline after the role label. Muted color +
+     help cursor hints that a tooltip (with full counts) is available. */
+  .turn-tokens { font-weight: 500; color: var(--text3); text-transform: none; letter-spacing: 0; font-size: 10px; margin-left: 6px; border-bottom: 1px dotted var(--border); cursor: help; }
   /* padding-right leaves room for the per-turn copy button in the top-right. */
   .bubble { position: relative; border-radius: var(--radius); padding: 12px 64px 12px 16px; font-size: 13px; line-height: 1.6; transition: outline-color 0.15s ease; }
   /* Per-turn copy button — always visible at low opacity for discoverability,
@@ -2053,6 +2068,21 @@ function renderConversation(turns, container) {
     const label = document.createElement('div');
     label.className = 'turn-label';
     label.textContent = labelText;
+    // Per-turn token badge. The backend attaches tokens_in / tokens_out to
+    // every assistant turn (user turns don't have a usage dict). We render
+    // a small inline badge so the reader can see which single reply was
+    // the expensive one. Tooltip spells out the full counts.
+    if (kind === 'assistant' && (typeof turn.tokens_in === 'number' || typeof turn.tokens_out === 'number')) {
+      const tok = document.createElement('span');
+      tok.className = 'turn-tokens';
+      tok.textContent = `${formatTokens(turn.tokens_in || 0)} in / ${formatTokens(turn.tokens_out || 0)} out`;
+      tok.title =
+        `Input: ${(turn.tokens_in || 0).toLocaleString()} tokens\n` +
+        `Output: ${(turn.tokens_out || 0).toLocaleString()} tokens\n\n` +
+        `Per-turn usage reported by the API for this single reply.`;
+      label.appendChild(document.createTextNode(' '));
+      label.appendChild(tok);
+    }
     div.appendChild(label);
 
     const bubble = document.createElement('div');
