@@ -500,6 +500,34 @@ def conversation_summary(filepath: Path) -> dict | None:
             if model:
                 break
 
+    # Token usage tally.
+    # Claude Code / Cowork transcripts store a ``usage`` dict on each
+    # assistant turn with four counters: plain input tokens, cache-creation
+    # input tokens, cache-read input tokens, and output tokens. We sum all
+    # four across the conversation so the reader header can show the user a
+    # rough "cost" figure for the thread. These are PER-TURN counts, not a
+    # context-window snapshot — see HISTORY_RETENTION.md / the context-window
+    # report for the distinction.
+    tokens_in = 0
+    tokens_out = 0
+    tokens_cache_read = 0
+    tokens_cache_creation = 0
+    for m in messages:
+        if m.get("type") != "assistant":
+            continue
+        usage = (m.get("message") or {}).get("usage") or {}
+        try:
+            tokens_in += int(usage.get("input_tokens") or 0)
+            tokens_out += int(usage.get("output_tokens") or 0)
+            tokens_cache_read += int(usage.get("cache_read_input_tokens") or 0)
+            tokens_cache_creation += int(
+                usage.get("cache_creation_input_tokens") or 0
+            )
+        except (TypeError, ValueError):
+            # Older transcripts may have non-numeric or missing counters;
+            # silently skip rather than break the whole summary.
+            pass
+
     # Extra metadata pulled from the JSONL records themselves.
     # Claude Code / Cowork transcripts commonly carry these fields.
     session_id = _first_nonempty(messages, "sessionId")
@@ -530,6 +558,11 @@ def conversation_summary(filepath: Path) -> dict | None:
         "git_branch": git_branch,
         "cc_version": cc_version,
         "user_type": user_type,
+        # Token usage totals (summed across all assistant turns).
+        "tokens_in": tokens_in,
+        "tokens_out": tokens_out,
+        "tokens_cache_read": tokens_cache_read,
+        "tokens_cache_creation": tokens_cache_creation,
     }
 
 
@@ -1221,6 +1254,13 @@ HTML_TEMPLATE = r"""
   #conv-header { padding: 12px 24px; background: var(--surface); border-bottom: 1px solid var(--border); flex-shrink: 0; display: none; }
   #conv-header h2 { font-size: 15px; font-weight: 600; color: var(--text); }
   #conv-header .meta { font-size: 12px; color: var(--text3); margin-top: 3px; }
+  /* Token tally in the conversation header. Slight accent colour + help
+     cursor hints that hovering reveals a cache-usage breakdown tooltip. */
+  #conv-header .meta .meta-tokens {
+    color: var(--text2);
+    cursor: help;
+    border-bottom: 1px dotted var(--border);
+  }
 
   /* ── Messages ── */
   .turn { margin-bottom: 18px; }
@@ -1618,7 +1658,38 @@ async function openConversation(c) {
   const projLabel = c.project_session && c.project_session !== c.project
     ? `${c.project} (${c.project_session})`
     : c.project;
-  document.getElementById('ch-meta').textContent = `${projLabel}  ·  ${c.user_count} messages  ·  ${date}  ·  ${c.model || ''}`;
+
+  // Build a token summary segment for the header. We show input/output totals
+  // inline (compact, e.g. "124.5K in / 48.2K out") and surface the cache-read
+  // / cache-creation breakdown as a tooltip so the header stays scannable.
+  const metaEl = document.getElementById('ch-meta');
+  metaEl.innerHTML = '';
+
+  const leftText = `${projLabel}  ·  ${c.user_count} messages  ·  `;
+  metaEl.appendChild(document.createTextNode(leftText));
+
+  if (typeof c.tokens_in === 'number' || typeof c.tokens_out === 'number') {
+    const tokenSpan = document.createElement('span');
+    tokenSpan.className = 'meta-tokens';
+    tokenSpan.textContent = `${formatTokens(c.tokens_in)} in / ${formatTokens(c.tokens_out)} out`;
+    // Tooltip: full counts with commas + cache breakdown.
+    const tipParts = [
+      `Input: ${(c.tokens_in || 0).toLocaleString()} tokens`,
+      `Output: ${(c.tokens_out || 0).toLocaleString()} tokens`,
+    ];
+    if (c.tokens_cache_read) {
+      tipParts.push(`Cache read: ${c.tokens_cache_read.toLocaleString()} tokens`);
+    }
+    if (c.tokens_cache_creation) {
+      tipParts.push(`Cache write: ${c.tokens_cache_creation.toLocaleString()} tokens`);
+    }
+    tipParts.push('', 'Totals are summed across assistant turns — not a snapshot of the context window.');
+    tokenSpan.title = tipParts.join('\n');
+    metaEl.appendChild(tokenSpan);
+    metaEl.appendChild(document.createTextNode('  ·  '));
+  }
+
+  metaEl.appendChild(document.createTextNode(`${date}  ·  ${c.model || ''}`));
 
   // Hide search results / welcome
   document.getElementById('welcome').style.display = 'none';
@@ -2162,6 +2233,21 @@ document.getElementById('path-btn').addEventListener('click', async () => {
 function esc(s) {
   if (s === null || s === undefined) return '';
   return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+// Format a raw token count into a compact human-readable string, e.g.:
+//   null/undefined/0 → "0"
+//   842              → "842"
+//   12_340           → "12.3K"
+//   1_250_000        → "1.25M"
+// Kept short so the reader-pane header stays scannable; the full count with
+// commas is shown in the tooltip by the caller.
+function formatTokens(n) {
+  const v = Number(n || 0);
+  if (!isFinite(v) || v <= 0) return '0';
+  if (v >= 1e6) return (v / 1e6).toFixed(v >= 1e7 ? 1 : 2).replace(/\.?0+$/, '') + 'M';
+  if (v >= 1e3) return (v / 1e3).toFixed(v >= 1e4 ? 0 : 1).replace(/\.0$/, '') + 'K';
+  return String(v);
 }
 
 init();
