@@ -239,7 +239,15 @@ def content_blocks(content):
             if t == "text":
                 blocks.append({"type": "text", "text": b.get("text", "")})
             elif t == "thinking":
-                blocks.append({"type": "thinking", "text": b.get("thinking", "")})
+                # Many transcripts store thinking blocks as
+                # {"type": "thinking", "thinking": "", "signature": "<opaque>"}.
+                # The `signature` is an encrypted cache key the API uses —
+                # the actual reasoning text simply wasn't persisted for that
+                # turn. Rendering an empty 🧠 box is pure noise, so we only
+                # emit the block when there's readable content.
+                text = (b.get("thinking") or "").strip()
+                if text:
+                    blocks.append({"type": "thinking", "text": text})
             elif t == "tool_use":
                 inp = b.get("input", {})
                 blocks.append(
