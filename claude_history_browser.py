@@ -24,7 +24,7 @@ from pathlib import Path
 
 # ── App metadata (shown in the About dialog and MD export headers) ───────────
 APP_NAME = "Claude History Browser"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 APP_AUTHOR = "@jamaia1971"
 APP_LICENSE = "MIT"
 APP_REPO = "https://github.com/jamaia1971/claude-history-browser"
@@ -41,7 +41,51 @@ except ImportError:
 # ── Config ───────────────────────────────────────────────────────────────────
 CONFIG_FILE = Path.home() / ".claude_history_browser.json"
 app = Flask(__name__)
-HISTORY_PATH: Path = None  # set at startup
+# List of configured history roots. Starts empty and is populated at startup
+# (or at runtime by the "Change folder" / "Add folder" buttons). Stored as a
+# list so the user can aggregate multiple history folders — e.g. their local
+# ~/.claude/projects plus a backup copy on an external drive — and browse
+# every conversation together in one unified view.
+HISTORY_PATHS: list[Path] = []
+
+
+def iter_history_files():
+    """Yield every ``.jsonl`` file across every configured history root.
+
+    Each root is walked independently; errors on one root (permission denied,
+    folder removed out from under us, etc.) are swallowed so the others still
+    work. The order across roots is stable (the order the user added them).
+    """
+    for root in HISTORY_PATHS:
+        try:
+            yield from root.rglob("*.jsonl")
+        except Exception:
+            continue
+
+
+def find_history_jsonl(conv_id: str):
+    """Return the first ``<conv_id>.jsonl`` found under any history root."""
+    for root in HISTORY_PATHS:
+        try:
+            for f in root.rglob(f"{conv_id}.jsonl"):
+                return f
+        except Exception:
+            continue
+    return None
+
+
+def _invalidate_caches():
+    """Drop any cache whose contents depend on the current HISTORY_PATHS.
+
+    Called whenever the tracked roots change (add / remove / replace) so
+    stale project_info entries — e.g. the ``(root)`` label computed against
+    the *old* set of roots — don't leak into the new view.
+    """
+    try:
+        _PROJECT_INFO_CACHE.clear()
+    except NameError:
+        # Called before the cache module-level dict has been defined.
+        pass
 
 
 # ── Folder picker (macOS Finder) ─────────────────────────────────────────────
@@ -161,16 +205,59 @@ def save_config(cfg):
     CONFIG_FILE.write_text(json.dumps(cfg, indent=2))
 
 
-def resolve_history_path() -> Path:
+def _config_history_paths(cfg: dict) -> list[str]:
+    """Read ``history_paths`` from the config, falling back to the legacy
+    ``history_path`` string key so older config files keep working."""
+    raw = cfg.get("history_paths")
+    if isinstance(raw, list) and raw:
+        return [str(p) for p in raw if isinstance(p, str) and p.strip()]
+    legacy = cfg.get("history_path")
+    if isinstance(legacy, str) and legacy.strip():
+        return [legacy]
+    return []
+
+
+def save_history_paths() -> None:
+    """Persist the in-memory ``HISTORY_PATHS`` list to the config file.
+
+    Also refreshes the legacy ``history_path`` key with the first entry so
+    an older build of this script (or any external tool that still reads
+    that key) picks up at least one of the tracked folders.
+    """
     cfg = load_config()
-    saved = cfg.get("history_path")
-    if saved:
-        p = Path(saved)
-        if p.exists():
+    cfg["history_paths"] = [str(p) for p in HISTORY_PATHS]
+    if HISTORY_PATHS:
+        cfg["history_path"] = str(HISTORY_PATHS[0])
+    elif "history_path" in cfg:
+        del cfg["history_path"]
+    save_config(cfg)
+
+
+def resolve_history_paths() -> list[Path]:
+    """Load saved history roots, prompt for one if nothing is configured."""
+    cfg = load_config()
+    saved = _config_history_paths(cfg)
+    existing: list[Path] = []
+    seen: set[str] = set()
+    for s in saved:
+        p = Path(s)
+        key = str(p.resolve()) if p.exists() else str(p)
+        if key in seen:
+            continue
+        if p.exists() and p.is_dir():
+            existing.append(p)
+            seen.add(key)
             print(f"📂 Using saved history path: {p}")
-            return p
         else:
             print(f"⚠️  Saved path no longer exists: {p}")
+
+    if existing:
+        # Persist the pruned list so stale entries don't linger.
+        if len(existing) != len(saved):
+            cfg["history_paths"] = [str(p) for p in existing]
+            cfg["history_path"] = str(existing[0])
+            save_config(cfg)
+        return existing
 
     chosen = prompt_folder_path()
     if not chosen:
@@ -178,10 +265,11 @@ def resolve_history_path() -> Path:
         sys.exit(1)
 
     p = Path(chosen)
+    cfg["history_paths"] = [str(p)]
     cfg["history_path"] = str(p)
     save_config(cfg)
     print(f"✅ Saved history path: {p}")
-    return p
+    return [p]
 
 
 # ── JSONL parsing ─────────────────────────────────────────────────────────────
@@ -413,7 +501,9 @@ def project_info(filepath: Path) -> dict:
       3. Otherwise, the decoded on-disk folder name (lossy).
       4. Otherwise, the raw folder name.
 
-    Files sitting directly in HISTORY_PATH get display "(root)".
+    Files sitting directly in any configured history root get display
+    "(root)". With multiple roots, any match counts — a file is "at the
+    root" relative to whichever root it happens to live under.
     """
     parent = filepath.parent
     parent_key = str(parent)
@@ -421,15 +511,18 @@ def project_info(filepath: Path) -> dict:
     if cached is not None:
         return cached
 
-    # Files at the root of the history folder
-    try:
-        rel = parent.relative_to(HISTORY_PATH)
-        if str(rel) in ("", "."):
-            info = {"display": "(root)", "session": None}
-            _PROJECT_INFO_CACHE[parent_key] = info
-            return info
-    except Exception:
-        pass
+    # Files at the root of *any* configured history folder get the "(root)"
+    # bucket. We iterate over every root because the user may have added
+    # more than one and a file only has to match one of them.
+    for root in HISTORY_PATHS:
+        try:
+            rel = parent.relative_to(root)
+            if str(rel) in ("", "."):
+                info = {"display": "(root)", "session": None}
+                _PROJECT_INFO_CACHE[parent_key] = info
+                return info
+        except Exception:
+            continue
 
     # 1. Try to pull cwd from any .jsonl in this parent folder.
     cwd = None
@@ -631,9 +724,9 @@ def favicon_ico():
 @app.route("/api/projects")
 def api_projects():
     """Return list of projects — every directory (at any depth) that
-    contains .jsonl files, relative to HISTORY_PATH."""
+    contains .jsonl files, relative to any configured history root."""
     projects = set()
-    for f in HISTORY_PATH.rglob("*.jsonl"):
+    for f in iter_history_files():
         projects.add(project_key(f))
     return jsonify(sorted(projects, key=lambda x: x.lower()))
 
@@ -642,14 +735,15 @@ def api_projects():
 def api_conversations():
     """Return summaries of all conversations, optionally filtered by project.
 
-    Scans HISTORY_PATH recursively so conversations in nested subfolders
-    are included.
+    Scans every configured history root recursively so conversations in
+    nested subfolders — and in any additional folders the user has added
+    via the "Add folder" button — are all included.
     """
     project_filter = request.args.get("project", "")
     search = request.args.get("q", "").lower()
 
     # Gather candidate files recursively, then filter by project if requested.
-    all_files = list(HISTORY_PATH.rglob("*.jsonl"))
+    all_files = list(iter_history_files())
     if project_filter:
         all_files = [f for f in all_files if project_key(f) == project_filter]
 
@@ -678,11 +772,8 @@ def api_conversations():
 @app.route("/api/conversation/<path:conv_id>")
 def api_conversation(conv_id):
     """Return full message list for a conversation."""
-    # Find the file
-    target = None
-    for f in HISTORY_PATH.rglob(f"{conv_id}.jsonl"):
-        target = f
-        break
+    # Find the file across every configured history root.
+    target = find_history_jsonl(conv_id)
     if not target:
         return jsonify({"error": "Not found"}), 404
 
@@ -725,7 +816,7 @@ def api_search():
         return jsonify([])
 
     results = []
-    for f in HISTORY_PATH.rglob("*.jsonl"):
+    for f in iter_history_files():
         try:
             raw = f.read_text(errors="replace")
             if q not in raw.lower():
@@ -770,43 +861,165 @@ def api_search():
 
 @app.route("/api/config")
 def api_config():
-    return jsonify({"history_path": str(HISTORY_PATH)})
+    """Return the list of configured history roots.
+
+    ``history_paths`` is the canonical key. ``history_path`` (first entry,
+    or "") is also included so any legacy caller / older UI build keeps
+    functioning without crashing.
+    """
+    return jsonify({
+        "history_paths": [str(p) for p in HISTORY_PATHS],
+        "history_path": str(HISTORY_PATHS[0]) if HISTORY_PATHS else "",
+    })
+
+
+def _pick_folder_from_body(body):
+    """Interpret a JSON body with ``mode`` (``finder`` or ``path``) and
+    return ``(chosen_path_str, error_tuple)``.
+
+    ``error_tuple`` is ``None`` on success, or ``(json_response, status)``
+    that the caller can return straight from the Flask view.
+    """
+    mode = (body.get("mode") or "finder").lower()
+    if mode == "path":
+        raw = body.get("path", "")
+        cleaned = normalize_path_input(raw)
+        if not cleaned:
+            return None, (jsonify({"error": "Empty path"}), 400)
+        p = Path(cleaned)
+        if not p.exists():
+            return None, (jsonify({"error": f"Path does not exist: {p}"}), 400)
+        if not p.is_dir():
+            return None, (jsonify({"error": f"Not a folder: {p}"}), 400)
+        return str(p), None
+    chosen = pick_folder_mac()
+    if not chosen:
+        return None, (jsonify({"error": "No folder selected"}), 400)
+    return chosen, None
+
+
+def _config_response():
+    """Standard success body for every /api/config/* route."""
+    return jsonify({
+        "history_paths": [str(p) for p in HISTORY_PATHS],
+        "history_path": str(HISTORY_PATHS[0]) if HISTORY_PATHS else "",
+    })
 
 
 @app.route("/api/config/change", methods=["POST"])
 def api_config_change():
-    """Let user pick a new folder at runtime.
+    """Replace the tracked folder list with a single chosen folder.
 
     Two modes:
       - {"mode": "finder"}  → open a Finder window to pick a folder
       - {"mode": "path", "path": "/abs/path"}  → use the supplied path directly
     If no body is supplied, defaults to Finder for backward compatibility.
     """
+    global HISTORY_PATHS
     body = request.get_json(silent=True) or {}
-    mode = (body.get("mode") or "finder").lower()
+    chosen, err = _pick_folder_from_body(body)
+    if err is not None:
+        return err
 
-    if mode == "path":
-        raw = body.get("path", "")
-        cleaned = normalize_path_input(raw)
-        if not cleaned:
-            return jsonify({"error": "Empty path"}), 400
-        p = Path(cleaned)
-        if not p.exists():
-            return jsonify({"error": f"Path does not exist: {p}"}), 400
-        if not p.is_dir():
-            return jsonify({"error": f"Not a folder: {p}"}), 400
-        chosen = str(p)
-    else:
-        chosen = pick_folder_mac()
-        if not chosen:
-            return jsonify({"error": "No folder selected"}), 400
+    HISTORY_PATHS = [Path(chosen)]
+    _invalidate_caches()
+    save_history_paths()
+    return _config_response()
 
-    global HISTORY_PATH
-    HISTORY_PATH = Path(chosen)
-    cfg = load_config()
-    cfg["history_path"] = str(HISTORY_PATH)
-    save_config(cfg)
-    return jsonify({"history_path": str(HISTORY_PATH)})
+
+@app.route("/api/config/add", methods=["POST"])
+def api_config_add():
+    """Append a new folder to the tracked list (deduped).
+
+    Same body shape as /api/config/change. Returns 400 if the folder is
+    already in the list — dedupe is on the resolved absolute path so
+    different spellings (symlinks, trailing slash) of the same folder
+    aren't treated as separate entries.
+    """
+    global HISTORY_PATHS
+    body = request.get_json(silent=True) or {}
+    chosen, err = _pick_folder_from_body(body)
+    if err is not None:
+        return err
+
+    new_path = Path(chosen)
+    try:
+        new_resolved = new_path.resolve()
+    except Exception:
+        new_resolved = new_path
+    for existing in HISTORY_PATHS:
+        try:
+            if existing.resolve() == new_resolved:
+                return jsonify({
+                    "error": "Folder already in the list",
+                    "history_paths": [str(p) for p in HISTORY_PATHS],
+                    "history_path": str(HISTORY_PATHS[0]) if HISTORY_PATHS else "",
+                }), 400
+        except Exception:
+            if str(existing) == str(new_path):
+                return jsonify({
+                    "error": "Folder already in the list",
+                    "history_paths": [str(p) for p in HISTORY_PATHS],
+                    "history_path": str(HISTORY_PATHS[0]) if HISTORY_PATHS else "",
+                }), 400
+
+    HISTORY_PATHS = HISTORY_PATHS + [new_path]
+    _invalidate_caches()
+    save_history_paths()
+    return _config_response()
+
+
+@app.route("/api/config/remove", methods=["POST"])
+def api_config_remove():
+    """Drop a folder from the tracked list (by exact path string).
+
+    Refuses to remove the last remaining folder — at least one root must
+    stay configured so the browser has something to scan. To replace the
+    last folder, use /api/config/change instead.
+    """
+    global HISTORY_PATHS
+    body = request.get_json(silent=True) or {}
+    target = (body.get("path") or "").strip()
+    if not target:
+        return jsonify({"error": "Missing path"}), 400
+
+    if len(HISTORY_PATHS) <= 1:
+        return jsonify({
+            "error": "Can't remove the last folder — use Change folder instead.",
+            "history_paths": [str(p) for p in HISTORY_PATHS],
+        }), 400
+
+    target_path = Path(target)
+    try:
+        target_resolved = target_path.resolve()
+    except Exception:
+        target_resolved = target_path
+
+    remaining: list[Path] = []
+    removed = False
+    for p in HISTORY_PATHS:
+        matched = False
+        try:
+            matched = p.resolve() == target_resolved
+        except Exception:
+            matched = False
+        if not matched and str(p) == str(target_path):
+            matched = True
+        if matched and not removed:
+            removed = True
+            continue
+        remaining.append(p)
+
+    if not removed:
+        return jsonify({
+            "error": "Folder is not in the list",
+            "history_paths": [str(p) for p in HISTORY_PATHS],
+        }), 404
+
+    HISTORY_PATHS = remaining
+    _invalidate_caches()
+    save_history_paths()
+    return _config_response()
 
 
 # ── Markdown export ──────────────────────────────────────────────────────────
@@ -917,8 +1130,12 @@ def api_about():
 
 
 def _build_export_markdown(ids):
-    """Shared builder used by both /api/download and /api/copy."""
-    all_files = {f.stem: f for f in HISTORY_PATH.rglob("*.jsonl")}
+    """Shared builder used by both /api/download and /api/copy.
+
+    Walks every configured history root, not just one, so exports work
+    even when the user is viewing an aggregated multi-folder list.
+    """
+    all_files = {f.stem: f for f in iter_history_files()}
 
     parts = []
     stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -1029,19 +1246,22 @@ def _copy_history_tree(src: Path, dst: Path):
 
 @app.route("/api/backup", methods=["POST"])
 def api_backup():
-    """Copy the entire history folder to a user-chosen destination.
+    """Copy every configured history folder to a user-chosen destination.
 
     The goal is to protect conversations from being wiped by system cleanup
-    or by a Claude app maintenance / update routine. We copy HISTORY_PATH
-    into a timestamped subfolder under the chosen destination, so repeated
-    backups to the same folder don't overwrite each other.
+    or by a Claude app maintenance / update routine. We create a single
+    timestamped backup folder under the chosen destination, then copy each
+    tracked history root into its own named subfolder inside it — so
+    aggregated multi-folder setups still yield one self-contained backup.
 
     Request body (JSON, all optional):
       - "mode": "finder" (default) or "path"
       - "path": destination folder (required when mode == "path")
     """
-    if HISTORY_PATH is None or not HISTORY_PATH.exists():
-        return jsonify({"error": "History folder is not configured."}), 400
+    # Guard: at least one configured source folder that still exists.
+    live_sources = [p for p in HISTORY_PATHS if p.exists()]
+    if not live_sources:
+        return jsonify({"error": "No history folders are configured."}), 400
 
     body = request.get_json(silent=True) or {}
     mode = (body.get("mode") or "finder").lower()
@@ -1065,18 +1285,25 @@ def api_backup():
             return jsonify({"error": "No destination folder selected"}), 400
         dest_root = Path(chosen)
 
-    # Refuse to back up inside the source folder — that would create an
-    # ever-growing nested copy and could recurse through the walk.
+    # Refuse to back up inside any of the source folders — that would
+    # create an ever-growing nested copy and could recurse through the walk.
     try:
         dest_resolved = dest_root.resolve()
-        src_resolved = HISTORY_PATH.resolve()
-        if dest_resolved == src_resolved or src_resolved in dest_resolved.parents:
-            return jsonify({
-                "error": (
-                    "Destination is inside the history folder. "
-                    "Please pick a location outside of it."
-                )
-            }), 400
+        for src in live_sources:
+            try:
+                src_resolved = src.resolve()
+                if (
+                    dest_resolved == src_resolved
+                    or src_resolved in dest_resolved.parents
+                ):
+                    return jsonify({
+                        "error": (
+                            "Destination is inside one of the history folders "
+                            f"({src}). Please pick a location outside of it."
+                        )
+                    }), 400
+            except Exception:
+                continue
     except Exception:
         pass  # best-effort safety check; continue if resolution fails
 
@@ -1084,21 +1311,65 @@ def api_backup():
     backup_name = f"claude-history-backup-{stamp}"
     backup_dir = dest_root / backup_name
 
-    try:
-        files_copied, bytes_copied, errors = _copy_history_tree(HISTORY_PATH, backup_dir)
-    except Exception as exc:
-        return jsonify({"error": f"Backup failed: {exc}"}), 500
+    total_files = 0
+    total_bytes = 0
+    all_errors: list[str] = []
+    per_source: list[dict] = []
+    used_names: set[str] = set()
+
+    for src in live_sources:
+        # Pick a subfolder name under the backup root. For a single source
+        # we write straight into backup_dir (preserves the existing layout
+        # from earlier single-folder backups). For multi-source we give
+        # each source its own subfolder keyed on its basename, deduped by
+        # appending a numeric suffix if the same basename appears twice.
+        if len(live_sources) == 1:
+            dst = backup_dir
+        else:
+            base = src.name or "history"
+            name = base
+            n = 1
+            while name in used_names or (backup_dir / name).exists():
+                n += 1
+                name = f"{base}-{n}"
+            used_names.add(name)
+            dst = backup_dir / name
+
+        try:
+            files_copied, bytes_copied, errors = _copy_history_tree(src, dst)
+        except Exception as exc:
+            all_errors.append(f"{src}: {exc}")
+            per_source.append({
+                "source": str(src),
+                "destination": str(dst),
+                "files_copied": 0,
+                "bytes_copied": 0,
+                "error": str(exc),
+            })
+            continue
+
+        total_files += files_copied
+        total_bytes += bytes_copied
+        all_errors.extend(errors)
+        per_source.append({
+            "source": str(src),
+            "destination": str(dst),
+            "files_copied": files_copied,
+            "bytes_copied": bytes_copied,
+            "error_count": len(errors),
+        })
 
     # Drop a small manifest so the user can tell what this backup is later.
     try:
         manifest = {
             "generator": f"{APP_NAME} v{APP_VERSION}",
             "created_at": datetime.now().isoformat(timespec="seconds"),
-            "source": str(HISTORY_PATH),
+            "sources": [str(p) for p in live_sources],
             "destination": str(backup_dir),
-            "files_copied": files_copied,
-            "bytes_copied": bytes_copied,
-            "errors": errors[:50],  # cap so the manifest stays small
+            "files_copied": total_files,
+            "bytes_copied": total_bytes,
+            "per_source": per_source,
+            "errors": all_errors[:50],  # cap so the manifest stays small
             "notice": APP_COPYRIGHT,
         }
         (backup_dir / "BACKUP_INFO.json").write_text(
@@ -1109,11 +1380,13 @@ def api_backup():
 
     return jsonify({
         "destination": str(backup_dir),
-        "files_copied": files_copied,
-        "bytes_copied": bytes_copied,
-        "bytes_human": _human_size(bytes_copied),
-        "errors": errors,
-        "error_count": len(errors),
+        "files_copied": total_files,
+        "bytes_copied": total_bytes,
+        "bytes_human": _human_size(total_bytes),
+        "errors": all_errors,
+        "error_count": len(all_errors),
+        "sources": [str(p) for p in live_sources],
+        "per_source": per_source,
     })
 
 
@@ -1162,8 +1435,26 @@ HTML_TEMPLATE = r"""
   header h1 span { color: var(--text2); font-weight: 400; }
   #search-global { flex: 1; background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 6px 12px; color: var(--text); font-size: 13px; outline: none; }
   #search-global:focus { border-color: var(--accent); }
-  #path-btn { background: var(--surface2); border: 1px solid var(--border); color: var(--text2); border-radius: 6px; padding: 5px 10px; cursor: pointer; font-size: 12px; white-space: nowrap; }
-  #path-btn:hover { color: var(--accent); border-color: var(--accent); }
+  #path-btn, #add-folder-btn { background: var(--surface2); border: 1px solid var(--border); color: var(--text2); border-radius: 6px; padding: 5px 10px; cursor: pointer; font-size: 12px; white-space: nowrap; font-family: inherit; }
+  #path-btn:hover, #add-folder-btn:hover { color: var(--accent); border-color: var(--accent); }
+  /* "Add folder" uses the secondary accent so it reads as "extend" rather
+     than "replace" — complements the existing "Change folder" visually. */
+  #add-folder-btn { color: var(--accent2); border-color: var(--accent2); background: transparent; }
+  #add-folder-btn:hover { background: var(--accent2); color: #0f1117; border-color: var(--accent2); }
+
+  /* ── Folders strip (below header) ──
+     A thin row showing every configured history root as a pill. Each pill
+     carries the folder's basename (full path on hover) and an × button to
+     remove it. The × is disabled when only one folder is tracked, because
+     the server refuses to leave HISTORY_PATHS empty. */
+  .folders-strip { display: flex; align-items: center; gap: 10px; padding: 6px 16px; background: var(--surface); border-bottom: 1px solid var(--border); font-size: 11px; color: var(--text3); flex-wrap: wrap; flex-shrink: 0; }
+  .folders-strip-label { text-transform: uppercase; letter-spacing: 0.06em; font-weight: 600; }
+  .folders-list { display: flex; gap: 6px; flex-wrap: wrap; }
+  .folder-pill { background: var(--surface2); border: 1px solid var(--border); border-radius: 999px; padding: 2px 4px 2px 10px; color: var(--text); font-size: 11px; display: inline-flex; align-items: center; gap: 4px; max-width: 360px; }
+  .folder-pill .folder-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .folder-pill .folder-remove { cursor: pointer; color: var(--text3); background: transparent; border: 0; font-size: 13px; line-height: 1; padding: 2px 8px; border-radius: 999px; font-family: inherit; }
+  .folder-pill .folder-remove:hover:not(:disabled) { color: #e89393; background: rgba(232,147,147,0.1); }
+  .folder-pill .folder-remove:disabled { opacity: 0.25; cursor: not-allowed; }
 
   /* ── About modal ── */
   #about-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,0.55); display: none; align-items: center; justify-content: center; z-index: 100; }
@@ -1386,8 +1677,18 @@ HTML_TEMPLATE = r"""
 <header>
   <h1 id="app-title" title="About this app">Claude <span>History Browser</span></h1>
   <input id="search-global" type="search" placeholder="Search all conversations... (press Enter)" />
-  <button id="path-btn" title="Change history folder">📂 Change folder</button>
+  <button id="path-btn" title="Replace every tracked folder with one chosen folder">📂 Change folder</button>
+  <button id="add-folder-btn" title="Add another folder to browse alongside the current one(s)">➕ Add folder</button>
 </header>
+
+<!-- Folders strip: lists every tracked history folder. The × on each pill
+     removes that folder from the browser (without touching the folder on
+     disk). Hidden when there are no folders yet, which shouldn't normally
+     happen at runtime but keeps the DOM tidy during init. -->
+<div id="folders-strip" class="folders-strip" style="display:none;">
+  <span class="folders-strip-label" id="folders-strip-label">Folders:</span>
+  <div id="folders-list" class="folders-list"></div>
+</div>
 
 <!-- About modal -->
 <div id="about-backdrop" role="dialog" aria-modal="true" aria-labelledby="about-title">
@@ -1683,6 +1984,10 @@ async function init() {
   initSelectAll();
   initCompactToggle();
   initFilters();
+  // Load the folders strip first (cheap — /api/config is a tiny read) so the
+  // user sees their tracked folders even before the list of conversations
+  // finishes populating.
+  await loadFolders();
   await loadProjects();
   await loadConversations();
 }
@@ -2624,25 +2929,134 @@ function showConvPanel() {
   }
 }
 
-// ── Change folder ────────────────────────────────────────────────────────────
-document.getElementById('path-btn').addEventListener('click', async () => {
+// ── Folder management (Change / Add / Remove) ──────────────────────────────
+//
+// Three related actions. "Change folder" replaces every tracked root with a
+// single chosen folder (single-folder flow — same as v1). "Add folder" appends
+// another root so multiple history folders can be browsed side-by-side in one
+// list. The folders strip under the header shows every current root as a pill;
+// the × on each pill removes that root from the list (but never deletes the
+// folder on disk).
+
+// Cached list of tracked paths. Refreshed from /api/config whenever folders
+// change, and re-rendered into the strip for the user.
+let HISTORY_PATHS_CLIENT = [];
+
+function basenameOf(p) {
+  if (!p) return '';
+  const s = String(p).replace(/[\\/]+$/, '');
+  const m = s.match(/[^\\/]+$/);
+  return m ? m[0] : s;
+}
+
+async function loadFolders() {
+  try {
+    const res = await fetch('/api/config');
+    if (!res.ok) return;
+    const cfg = await res.json();
+    HISTORY_PATHS_CLIENT = Array.isArray(cfg.history_paths)
+      ? cfg.history_paths
+      : (cfg.history_path ? [cfg.history_path] : []);
+    renderFolders();
+  } catch (_) { /* non-fatal — strip just stays empty */ }
+}
+
+function renderFolders() {
+  const strip = document.getElementById('folders-strip');
+  const list = document.getElementById('folders-list');
+  const label = document.getElementById('folders-strip-label');
+  if (!strip || !list) return;
+
+  const paths = HISTORY_PATHS_CLIENT || [];
+  if (!paths.length) {
+    strip.style.display = 'none';
+    return;
+  }
+  strip.style.display = 'flex';
+
+  if (label) {
+    label.textContent = paths.length === 1 ? 'Folder:' : `Folders (${paths.length}):`;
+  }
+
+  list.innerHTML = '';
+  const lastOne = paths.length <= 1;
+  paths.forEach(p => {
+    const pill = document.createElement('span');
+    pill.className = 'folder-pill';
+    pill.title = p;
+
+    const nameEl = document.createElement('span');
+    nameEl.className = 'folder-name';
+    nameEl.textContent = basenameOf(p) || p;
+    pill.appendChild(nameEl);
+
+    const rm = document.createElement('button');
+    rm.type = 'button';
+    rm.className = 'folder-remove';
+    rm.textContent = '✕';
+    rm.title = lastOne
+      ? 'At least one folder must stay in the list. Use "Change folder" to replace it.'
+      : 'Remove this folder from the browser (the folder on disk is NOT deleted).';
+    rm.disabled = lastOne;
+    rm.addEventListener('click', (e) => {
+      e.stopPropagation();
+      removeFolder(p);
+    });
+    pill.appendChild(rm);
+
+    list.appendChild(pill);
+  });
+}
+
+async function removeFolder(path) {
+  if (!confirm(
+    'Remove this folder from the browser?\n\n' + path +
+    '\n\n(The folder itself is NOT deleted — it\'s just dropped from the list.)'
+  )) return;
+
+  try {
+    const res = await fetch('/api/config/remove', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({path}),
+    });
+    if (res.ok) {
+      // Reload so every cached list (projects, conversations, etc.) is rebuilt
+      // against the new set of roots.
+      location.reload();
+      return;
+    }
+    let msg = 'Could not remove folder.';
+    try { msg = (await res.json()).error || msg; } catch (_) {}
+    alert(msg);
+  } catch (e) {
+    alert((e && e.message) || 'Could not remove folder.');
+  }
+}
+
+function promptFolderMode(promptText) {
   const choice = prompt(
-    'How would you like to set the history folder?\n\n' +
+    promptText + '\n\n' +
     '  1 = open a Finder window to pick it\n' +
     '  2 = type or paste the full folder path\n\n' +
     'Enter 1 or 2:',
     '1'
   );
-  if (choice === null) return;
-
-  let body;
+  if (choice === null) return null;
   if (choice.trim() === '2') {
-    const pasted = prompt('Paste the full path to your history folder:');
-    if (!pasted || !pasted.trim()) return;
-    body = {mode: 'path', path: pasted};
-  } else {
-    body = {mode: 'finder'};
+    const pasted = prompt('Paste the full path to the folder:');
+    if (!pasted || !pasted.trim()) return null;
+    return {mode: 'path', path: pasted};
   }
+  return {mode: 'finder'};
+}
+
+document.getElementById('path-btn').addEventListener('click', async () => {
+  const body = promptFolderMode(
+    'Replace every tracked folder with a single folder.\n' +
+    'How would you like to pick it?'
+  );
+  if (!body) return;
 
   const res = await fetch('/api/config/change', {
     method: 'POST',
@@ -2651,10 +3065,34 @@ document.getElementById('path-btn').addEventListener('click', async () => {
   });
   if (res.ok) {
     const cfg = await res.json();
-    alert('Folder changed to:\n' + cfg.history_path);
+    const first = (cfg.history_paths && cfg.history_paths[0]) || cfg.history_path || '(unknown)';
+    alert('Folder changed to:\n' + first);
     location.reload();
   } else {
     let msg = 'Could not change folder.';
+    try { msg = (await res.json()).error || msg; } catch (_) {}
+    alert(msg);
+  }
+});
+
+document.getElementById('add-folder-btn').addEventListener('click', async () => {
+  const body = promptFolderMode(
+    'Add another folder to browse alongside the current one(s).\n' +
+    'How would you like to pick it?'
+  );
+  if (!body) return;
+
+  const res = await fetch('/api/config/add', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(body),
+  });
+  if (res.ok) {
+    // Full reload so projects, conversations and the folders strip are all
+    // rebuilt against the new list of roots.
+    location.reload();
+  } else {
+    let msg = 'Could not add folder.';
     try { msg = (await res.json()).error || msg; } catch (_) {}
     alert(msg);
   }
@@ -2690,12 +3128,18 @@ init();
 
 # ── Entry point ────────────────────────────────────────────────────────────────
 def main():
-    global HISTORY_PATH
-    HISTORY_PATH = resolve_history_path()
+    global HISTORY_PATHS
+    HISTORY_PATHS = resolve_history_paths()
 
     port = 5757
     url = f"http://127.0.0.1:{port}"
     print(f"\n🚀 Starting Claude History Browser at {url}")
+    if len(HISTORY_PATHS) == 1:
+        print(f"   History folder: {HISTORY_PATHS[0]}")
+    else:
+        print(f"   History folders ({len(HISTORY_PATHS)}):")
+        for p in HISTORY_PATHS:
+            print(f"     • {p}")
     print("   Press Ctrl+C to stop.\n")
 
     # Open browser after a short delay
